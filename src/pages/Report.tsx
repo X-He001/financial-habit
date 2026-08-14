@@ -135,6 +135,18 @@ export default function Report() {
     })()
   }, [])
 
+  // 实时同步：云端数据更新（dashboard-refresh 事件）后重新生成报表
+  useEffect(() => {
+    const h = () => {
+      void (async () => {
+        setReports(await loadCache())
+        setAiCount(await getAiMonthCount())
+      })()
+    }
+    window.addEventListener('dashboard-refresh', h)
+    return () => window.removeEventListener('dashboard-refresh', h)
+  }, [])
+
   useEffect(() => {
     void refreshFacts(tab)
     // eslint-disable-next-line react-hooks/exhaustive-deps

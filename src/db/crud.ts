@@ -1,5 +1,7 @@
 import type { IndexableType } from 'dexie'
 import { db } from './database'
+import { requestPushToCloud } from '../sync/realtimeSync'
+import { LAST_SYNC_AT_KEY } from '../sync/pushSync'
 import type {
   Transaction, Account, SavingsGoal, SinkingFund,
   WishlistItem, Debt, SavingsRule, NotificationLog, Category, Schedule, Setting, WishlistChat,
@@ -19,6 +21,7 @@ function uuid(): string {
 export async function addTransaction(data: Omit<Transaction, 'id'>): Promise<string> {
   const id = uuid()
   await db.transactions.add({ id, ...data } as Transaction)
+  requestPushToCloud() // 写操作成功 → 实时推送
   return id
 }
 
@@ -28,10 +31,12 @@ export async function getTransaction(id: string): Promise<Transaction | undefine
 
 export async function updateTransaction(id: string, data: Partial<Transaction>): Promise<void> {
   await db.transactions.update(id, data)
+  requestPushToCloud()
 }
 
 export async function deleteTransaction(id: string): Promise<void> {
   await db.transactions.delete(id)
+  requestPushToCloud()
 }
 
 export async function getAllTransactions(): Promise<Transaction[]> {
@@ -75,6 +80,7 @@ export async function getAccountsByField(field: keyof Account, value: IndexableT
 export async function addSavingsGoal(data: Omit<SavingsGoal, 'id'>): Promise<string> {
   const id = uuid()
   await db.savingsGoals.add({ id, ...data } as SavingsGoal)
+  requestPushToCloud()
   return id
 }
 
@@ -84,10 +90,12 @@ export async function getSavingsGoal(id: string): Promise<SavingsGoal | undefine
 
 export async function updateSavingsGoal(id: string, data: Partial<SavingsGoal>): Promise<void> {
   await db.savingsGoals.update(id, data)
+  requestPushToCloud()
 }
 
 export async function deleteSavingsGoal(id: string): Promise<void> {
   await db.savingsGoals.delete(id)
+  requestPushToCloud()
 }
 
 export async function getAllSavingsGoals(): Promise<SavingsGoal[]> {
@@ -184,6 +192,7 @@ export async function getAllWishlistChats(): Promise<WishlistChat[]> {
 export async function addDebt(data: Omit<Debt, 'id'>): Promise<string> {
   const id = uuid()
   await db.debts.add({ id, ...data } as Debt)
+  requestPushToCloud()
   return id
 }
 
@@ -193,10 +202,12 @@ export async function getDebt(id: string): Promise<Debt | undefined> {
 
 export async function updateDebt(id: string, data: Partial<Debt>): Promise<void> {
   await db.debts.update(id, data)
+  requestPushToCloud()
 }
 
 export async function deleteDebt(id: string): Promise<void> {
   await db.debts.delete(id)
+  requestPushToCloud()
 }
 
 export async function getAllDebts(): Promise<Debt[]> {
@@ -375,6 +386,7 @@ export async function getAllCategories(): Promise<Category[]> {
 export async function addSchedule(data: Omit<Schedule, 'id'>): Promise<string> {
   const id = uuid()
   await db.schedules.add({ id, ...data } as Schedule)
+  requestPushToCloud()
   return id
 }
 
@@ -384,10 +396,12 @@ export async function getSchedule(id: string): Promise<Schedule | undefined> {
 
 export async function updateSchedule(id: string, data: Partial<Schedule>): Promise<void> {
   await db.schedules.update(id, data)
+  requestPushToCloud()
 }
 
 export async function deleteSchedule(id: string): Promise<void> {
   await db.schedules.delete(id)
+  requestPushToCloud()
 }
 
 export async function getAllSchedules(): Promise<Schedule[]> {
@@ -407,6 +421,8 @@ export async function getSetting(key: string): Promise<number | string | undefin
 
 export async function setSetting(key: string, value: number | string): Promise<void> {
   await db.settings.put({ id: key, value } as Setting)
+  // 同步时间戳由同步流程自身写入，不触发推送，避免推送自循环
+  if (key !== LAST_SYNC_AT_KEY) requestPushToCloud()
 }
 
 export async function getAllSettings(): Promise<Setting[]> {

@@ -12,11 +12,13 @@
 // =====================================================================
 import express from 'express'
 import cors from 'cors'
+import http from 'node:http'
 import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { initSchema } from './db.js'
 import { apiRouter } from './routes/index.js'
+import { initRealtime } from './realtime.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -63,9 +65,13 @@ app.use((err, req, res, _next) => {
 
 // 启动
 initSchema()
-app.listen(PORT, () => {
+const server = http.createServer(app)
+// WebSocket 实时同步（/ws 路径，与 HTTP 共用同一端口 3001）
+initRealtime(server)
+server.listen(PORT, () => {
   console.log(`🚀 Financial Habit 已启动：http://localhost:${PORT}`)
   console.log(`   健康检查：http://localhost:${PORT}/api/health`)
+  console.log(`   实时同步：ws://localhost:${PORT}/ws`)
   if (distExists) {
     console.log(`   网站：http://localhost:${PORT}/ （前后端一体，单进程）`)
   } else {

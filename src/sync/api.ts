@@ -21,13 +21,19 @@ export function setBaseUrl(url: string): void {
   _baseUrl = url.trim().replace(/\/+$/, '')
 }
 
+import { getClientId } from './clientId'
+
 // ----- 通用请求工具 -----
 
 async function request<T>(path: string, method: string, body?: unknown): Promise<T> {
   const url = `${getBaseUrl()}${path}`
   const res = await fetch(url, {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      // 携带客户端标识：服务端写入后广播 by=本端 id，前端可忽略自身变更
+      'x-client-id': getClientId(),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   if (!res.ok) {

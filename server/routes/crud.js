@@ -4,11 +4,17 @@
 import { Router } from 'express'
 import { randomUUID } from 'node:crypto'
 import { db } from '../db.js'
+import { broadcast } from '../realtime.js'
 
 function reverseMap(fieldMap) {
   const rev = {}
   for (const [k, v] of Object.entries(fieldMap)) rev[v] = k
   return rev
+}
+
+/** 写操作成功后广播变更通知（by 透传请求头 x-client-id，前端可据此忽略自身变更） */
+function broadcastDataChanged(req) {
+  broadcast({ type: 'data-changed', by: req.header('x-client-id') ?? 'server', at: Date.now() })
 }
 
 /**
@@ -82,6 +88,7 @@ export function createCrudRouter(cfg) {
       const sql = `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})`
       db.prepare(sql).run(...vals)
       const row = db.prepare(`SELECT * FROM ${table} WHERE ${idCol} = ?`).get(id)
+      broadcastDataChanged(req)
       res.status(201).json(toJson(row))
     } catch (e) { next(e) }
   })
@@ -101,6 +108,7 @@ export function createCrudRouter(cfg) {
       db.prepare(sql).run(...keys.map(k => sanitize(clean[k])), req.params.id)
       const row = db.prepare(`SELECT * FROM ${table} WHERE ${idCol} = ?`).get(req.params.id)
       if (!row) return res.status(404).json({ error: 'not found' })
+      broadcastDataChanged(req)
       res.json(toJson(row))
     } catch (e) { next(e) }
   })
@@ -110,6 +118,7 @@ export function createCrudRouter(cfg) {
     try {
       const info = db.prepare(`DELETE FROM ${table} WHERE ${idCol} = ?`).run(req.params.id)
       if (info.changes === 0) return res.status(404).json({ error: 'not found' })
+      broadcastDataChanged(req)
       res.json({ ok: true })
     } catch (e) { next(e) }
   })

@@ -142,6 +142,14 @@ export default function Ledger() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { loadData() }, [])
 
+  // 实时同步：云端数据更新（dashboard-refresh 事件）后重新加载
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const h = () => { void loadData() }
+    window.addEventListener('dashboard-refresh', h)
+    return () => window.removeEventListener('dashboard-refresh', h)
+  }, [])
+
   // 响应式：监听窗口宽度
   useEffect(() => {
     const h = () => setIsWide(window.innerWidth >= 900)

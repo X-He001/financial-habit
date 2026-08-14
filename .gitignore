@@ -17,6 +17,12 @@ server/*.sqlite
 server/*.sqlite-shm
 server/*.sqlite-wal
 
+# 本地打包与截图，不提交
+FH.zip
+desktop.ini
+屏幕截图*.png
+FH/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

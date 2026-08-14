@@ -1,7 +1,7 @@
 import { db } from '../db/database'
 import {
   addTransaction, addWishlistItem, addSchedule, getSetting,
-  updateSavingsGoal, getAllSavingsGoals,
+  updateSavingsGoal, getAllSavingsGoals, deleteTransaction,
 } from '../db/crud'
 import type { PendingTx } from '../utils/impulseEngine'
 import { guardTransaction, platformOf, isImpulsive } from '../utils/impulseEngine'
@@ -432,7 +432,7 @@ async function generateReportTool(args: Record<string, unknown>): Promise<object
 async function deleteLastTransactionTool(): Promise<object> {
   if (!lastAddTxId) return { success: false, deleted: false, reason: '没有可撤销的上一笔记账' }
   const t = await db.transactions.get(lastAddTxId)
-  await db.transactions.delete(lastAddTxId)
+  await deleteTransaction(lastAddTxId)
   lastAddTxId = null
   recordLastOp(null)
   window.dispatchEvent(new CustomEvent('dashboard-refresh'))
