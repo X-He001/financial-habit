@@ -190,10 +190,16 @@ function rowToJson(cfg, row) {
   for (const [api, col] of Object.entries(cfg.fields)) rev[col] = api
 
   const out = {}
-  if (row[cfg.idCol] !== undefined) out.id = row[cfg.idCol]
+  // 主键列：默认 'id'，settings 表为 'key'
+  const idCol = cfg.idCol || 'id'
+  const idVal = row[idCol]
+  // 确保写入 IndexedDB 前 id 一定有有效值（避免 bulkPut 报 "key path did not yield a value"）
+  if (idVal !== undefined && idVal !== null && idVal !== '') {
+    out.id = idVal
+  }
   for (const [col, val] of Object.entries(row)) {
     const api = rev[col]
-    if (!api || api === cfg.idCol) continue
+    if (!api || api === idCol) continue
     let v = val
     if (cfg.bool?.includes(col)) {
       // SQLite 0/1 → boolean（null 保持 null）
@@ -212,10 +218,19 @@ export const syncRouter = Router()
 syncRouter.get('/pull', (req, res, next) => {
   try {
     const data = {}
+    let skipped = 0
     for (const cfg of TABLES) {
       const rows = db.prepare(`SELECT * FROM ${cfg.table}`).all()
-      data[cfg.api] = rows.map(row => rowToJson(cfg, row))
+      const list = []
+      for (const row of rows) {
+        const json = rowToJson(cfg, row)
+        // 防御：无有效 id 的行跳过，避免前端 bulkPut 因 keyPath 无值而整体失败
+        if (json.id === undefined) { skipped++; continue }
+        list.push(json)
+      }
+      data[cfg.api] = list
     }
+    if (skipped > 0) console.warn(`[sync] pull 跳过 ${skipped} 行缺少 id 的记录`)
     res.json({ success: true, data })
   } catch (e) { next(e) }
 })
