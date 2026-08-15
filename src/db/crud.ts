@@ -13,7 +13,8 @@ import type {
 // ==================== 通用 CRUD 工具 ====================
 
 function uuid(): string {
-  return crypto.randomUUID()
+  // HTTP 非安全上下文下 crypto.randomUUID 不可用，提供兜底（兼容写法）
+  return (crypto.randomUUID ? crypto.randomUUID() : (function(){return"xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,function(c){var r=crypto.getRandomValues(new Uint8Array(1))[0]%16;return(c==="x"?r:(r&3|8)).toString(16)})})())
 }
 
 // ==================== Transaction ====================

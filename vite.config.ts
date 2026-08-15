@@ -40,4 +40,10 @@ export default defineConfig({
       },
     }),
   ],
+  // 开发模式：/api 转发到本地后端（3001），让 AI 代理等后端接口在 dev 下可用
+  server: {
+    proxy: {
+      '/api': 'http://localhost:3001',
+    },
+  },
 })

@@ -5,6 +5,7 @@ import { Router } from 'express'
 import { createCrudRouter } from './crud.js'
 import { summaryRouter } from './summary.js'
 import { syncRouter } from './sync.js'
+import { aiRouter } from './ai.js'
 
 export const apiRouter = Router()
 
@@ -71,3 +72,6 @@ apiRouter.use('/dashboard-summary', summaryRouter)
 
 // ---- 数据同步（拉取云端全量数据） ----
 apiRouter.use('/sync', syncRouter)
+
+// ---- AI 代理（批量导入结构化提取，Key 只存服务器） ----
+apiRouter.use('/ai', aiRouter)

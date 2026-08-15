@@ -12,16 +12,18 @@ dist
 dist-ssr
 *.local
 
-# SQLite 数据库文件（含个人财务数据，不提交到 GitHub）
+# 旧副本与压缩包（不入库）
+FH/
+FH.zip
+
+# 本地数据库（含个人财务数据，绝不上传）
 server/*.sqlite
 server/*.sqlite-shm
 server/*.sqlite-wal
 
-# 本地打包与截图，不提交
-FH.zip
+# 本地杂物
 desktop.ini
 屏幕截图*.png
-FH/
 
 # Editor directories and files
 .vscode/*

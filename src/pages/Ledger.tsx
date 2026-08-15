@@ -7,6 +7,7 @@ import type { Transaction, Category, CreditAccount } from '../types'
 import OcrTab from '../components/ledger/OcrTab'
 import VoiceTab from '../components/ledger/VoiceTab'
 import ImportTab from '../components/ledger/ImportTab'
+import BatchImportTab from '../components/ledger/BatchImportTab'
 import { runSaveFlow } from '../utils/saveFlow'
 import { SHOP_CATEGORIES, isImpulsive } from '../utils/impulseEngine'
 import { computeFragileWindows, getFragileWindowNow } from '../agent/metrics'
@@ -24,6 +25,7 @@ const LEDGER_TABS = [
   { key: 'ocr', label: '📷 截图识别' },
   { key: 'voice', label: '🎤 语音记账' },
   { key: 'import', label: '📥 导入' },
+  { key: 'batch', label: '📦 批量导入' },
 ] as const
 type LedgerTab = typeof LEDGER_TABS[number]['key']
 
@@ -415,6 +417,9 @@ export default function Ledger() {
 
           {/* Import Tab */}
           {tab === 'import' && <ImportTab />}
+
+          {/* Batch Import Tab */}
+          {tab === 'batch' && <BatchImportTab onSaved={loadData} />}
 
           {/* 手动记账表单 */}
           {tab === 'manual' && (

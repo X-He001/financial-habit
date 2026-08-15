@@ -29,7 +29,7 @@ const FRONTEND_DIST = process.env.FRONTEND_DIST
 
 const app = express()
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '2mb' }))
 
 // 健康检查
 app.get('/api/health', (req, res) => {
