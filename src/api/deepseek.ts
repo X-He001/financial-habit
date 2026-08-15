@@ -603,21 +603,29 @@ export async function testModelConnection(cfg: ModelConfig): Promise<ConnectionT
   return { ok: true, message: '连接成功' }
 }
 
-/** 把口语描述解析成一条结构化记账数据 */
-export async function parseVoiceText(text: string): Promise<ParsedLedgerItem> {
+/** 把口语描述解析成一条或多条结构化记账数据（一句里可能提到多笔消费，全部提取） */
+export async function parseVoiceTextMulti(text: string): Promise<ParsedLedgerItem[]> {
   if (!text.trim()) throw new Error('EMPTY_TEXT')
 
   const content = await chatCompletion([
-    { role: 'system', content: SYSTEM_MSG },
+    { role: 'system', content: MULTI_SYSTEM_MSG },
     {
       role: 'user',
-      content: `请把下面这条口语描述解析成一条消费记录，返回严格 JSON：{"amount": 金额（元，数字）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "YYYY-MM-DD（没提到日期就用今天）", "paymentMethod": "微信|支付宝|银行卡|现金|花呗|信用支付|先用后付|分期", "note": "备注或空字符串"}。
-描述："""${text}"""`,
+      content:
+        `请把下面这段口语描述解析成一条或多条消费记录，返回严格 JSON 对象：{"items": [ {记录}, {记录}, ... ]}。\n` +
+        `要求：描述里可能同时提到多笔消费（例如「38块买奶茶，65块吃火锅，12块坐地铁」就是 3 笔），请逐笔全部提取、不能遗漏也不能合并；金额单位是元（「38块」就是 38 元）；没提到的字段用合理默认值（分类按商家判断，日期用今天，支付方式默认「微信」）。\n` +
+        `每条记录格式：{"amount": 金额（元，数字）, "txType": "expense" 支出 或 "income" 收入（默认 "expense"）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "YYYY-MM-DD（没提到日期就用今天）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}。\n` +
+        `描述："""${text}"""`,
     },
   ], { json: true, temperature: 0.1 })
 
-  const rawList = parseJsonArray(content)
-  return normalizeItem(rawList[0])
+  const rawList = extractJsonList(content)
+  return rawList
+    .map((r): ParsedLedgerItem => ({
+      ...normalizeItem(r),
+      txType: String(r.txType ?? '').toLowerCase() === 'income' ? 'income' : 'expense',
+    }))
+    .filter(it => it.amount > 0)
 }
 
 // ==================== 报告 / 问答 / 冲动解读 ====================

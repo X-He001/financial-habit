@@ -1,12 +1,13 @@
 import { useState, useRef } from 'react'
-import type { ParsedLedgerItem } from '../../api/deepseek'
-import { parseVoiceText, hasApiKey } from '../../api/deepseek'
-import { saveParsedLedger } from '../../utils/ledgerSave'
-import EditableItemForm from './EditableItemForm'
+import { parseVoiceTextMulti, hasApiKey } from '../../api/deepseek'
+import { visionItemsToBatch } from '../../utils/batchImport'
+import type { BatchItem } from '../../utils/batchImport'
+import BatchPreviewList from './BatchPreviewList'
 
 interface Props { onSaved: () => void }
 
 const EXAMPLES = [
+  '「今天花了38块买奶茶，65块吃火锅，12块坐地铁」',
   '「中午吃饭花了35块」',
   '「拼多多买了89块的手机壳，先用后付」',
   '「昨天打车28」',
@@ -16,7 +17,7 @@ export default function VoiceTab({ onSaved }: Props) {
   const [listening, setListening] = useState(false)
   const [transcript, setTranscript] = useState('')
   const [recognizing, setRecognizing] = useState(false)
-  const [parsed, setParsed] = useState<ParsedLedgerItem | null>(null)
+  const [items, setItems] = useState<BatchItem[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const recRef = useRef<{ stop: () => void } | null>(null)
   const supported = !!(window as unknown as Record<string, unknown>).SpeechRecognition
@@ -62,10 +63,14 @@ export default function VoiceTab({ onSaved }: Props) {
     if (!text || recognizing) return
     const ok = await hasApiKey()
     if (!ok) { setError('请先到设置页配置 API Key'); return }
-    setRecognizing(true); setError(null)
+    setRecognizing(true); setError(null); setItems(null)
     try {
-      const item = await parseVoiceText(text)
-      setParsed(item)
+      const list = await parseVoiceTextMulti(text)
+      if (list.length === 0) {
+        setError('没有识别到有效的消费记录，请确认描述里有金额（如「38块买奶茶」）')
+        return
+      }
+      setItems(visionItemsToBatch(list))
     } catch (e) {
       if (e instanceof Error && e.message === 'NO_API_KEY') setError('请先到设置页配置 API Key')
       else setError('解析失败，请检查网络或 API Key，也可以手动修改文字后重试')
@@ -74,13 +79,10 @@ export default function VoiceTab({ onSaved }: Props) {
     }
   }
 
-  async function handleSave() {
-    if (!parsed) return
-    const ok = await saveParsedLedger(parsed, 'voice')
-    if (!ok) return
-    setParsed(null)
+  function resetAll() {
+    setItems(null)
     setTranscript('')
-    onSaved()
+    setError(null)
   }
 
   return (
@@ -136,19 +138,25 @@ export default function VoiceTab({ onSaved }: Props) {
       )}
 
       {/* 例子 */}
-      <div style={{ marginTop: 16, fontSize: 12, color: '#A0A4A4', textAlign: 'left', lineHeight: 2 }}>
-        可以说这些试试：
-        <div style={{ color: '#888888' }}>
-          {EXAMPLES.map((s) => <div key={s}>· {s}</div>)}
+      {!items && (
+        <div style={{ marginTop: 16, fontSize: 12, color: '#A0A4A4', textAlign: 'left', lineHeight: 2 }}>
+          可以说这些试试（一句话可以说多笔）：
+          <div style={{ color: '#888888' }}>
+            {EXAMPLES.map((s) => <div key={s}>· {s}</div>)}
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* 确认卡片 */}
-      {parsed && (
-        <div style={{ marginTop: 18, background: '#D8DADA', border: '1px solid #C0C4C4', borderRadius: 16, padding: 16, boxShadow: '0 1px 2px rgba(16,24,40,0.04), 0 4px 16px rgba(16,24,40,0.04)', textAlign: 'left' }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: '#111111', marginBottom: 12 }}>解析结果，确认后保存</div>
-          <EditableItemForm value={parsed} onChange={setParsed} onSave={handleSave} saveLabel="✓ 保存这笔" />
-        </div>
+      {/* 多记录预览列表 */}
+      {items && items.length > 0 && (
+        <BatchPreviewList
+          items={items}
+          onChange={setItems}
+          onSaved={onSaved}
+          title="语音识别"
+          resetLabel="重新开始"
+          onReset={resetAll}
+        />
       )}
     </div>
   )

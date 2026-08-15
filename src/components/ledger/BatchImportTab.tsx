@@ -1,9 +1,7 @@
-import { useState, useEffect, useRef } from 'react'
-import type { Category } from '../../types'
-import { getAllCategories } from '../../db/crud'
-import { LEDGER_CATEGORIES, LEDGER_PAYMENTS } from '../../api/deepseek'
-import { parseImportFile, saveBatchItems } from '../../utils/batchImport'
+import { useState, useRef } from 'react'
+import { parseImportFile } from '../../utils/batchImport'
 import type { BatchItem } from '../../utils/batchImport'
+import BatchPreviewList from './BatchPreviewList'
 
 interface Props {
   /** 保存成功后回调（父组件刷新交易列表） */
@@ -16,34 +14,18 @@ const STEPS = [
   '确认无误后批量保存，自动计算每条记录的冲动指数',
 ]
 
-const inputStyle: React.CSSProperties = {
-  width: '100%', padding: '7px 10px', borderRadius: 8, border: '1px solid #C0C4C4',
-  fontSize: 13, fontFamily: 'var(--font-stack)', outline: 'none', color: '#111111',
-  background: '#FAFBFC', boxSizing: 'border-box', fontVariantNumeric: 'tabular-nums',
-}
-
 export default function BatchImportTab({ onSaved }: Props) {
   const [items, setItems] = useState<BatchItem[] | null>(null)
   const [fileName, setFileName] = useState('')
   const [busy, setBusy] = useState(false)
-  const [saving, setSaving] = useState(false)
   const [stage, setStage] = useState<{ label: string; percent: number | null } | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [okMsg, setOkMsg] = useState<string | null>(null)
   const [dragOver, setDragOver] = useState(false)
-  const [categories, setCategories] = useState<Category[]>([])
   const fileRef = useRef<HTMLInputElement>(null)
 
-  useEffect(() => { void getAllCategories().then(setCategories) }, [])
-
-  // 分类下拉：系统 7 分类 + 用户自定义（去重）
-  const catOptions = [...LEDGER_CATEGORIES, ...categories.map((c) => c.name)]
-    .filter((v, idx, arr) => arr.indexOf(v) === idx)
-
   function handleFile(file: File) {
-    if (busy || saving) return
+    if (busy) return
     setError(null)
-    setOkMsg(null)
     setItems(null)
     setFileName(file.name)
     setBusy(true)
@@ -67,47 +49,11 @@ export default function BatchImportTab({ onSaved }: Props) {
       })
   }
 
-  function updateItem(uid: string, patch: Partial<BatchItem>) {
-    setItems((prev) => prev && prev.map((it) => (it.uid === uid ? { ...it, ...patch } : it)))
-  }
-
-  function toggleItem(uid: string) {
-    setItems((prev) => prev && prev.map((it) => (it.uid === uid ? { ...it, checked: !it.checked } : it)))
-  }
-
-  function removeItem(uid: string) {
-    setItems((prev) => prev && prev.filter((it) => it.uid !== uid))
-  }
-
-  const allChecked = items ? items.length > 0 && items.every((it) => it.checked) : false
-  const selectedCount = items ? items.filter((it) => it.checked).length : 0
-
-  async function handleSave() {
-    if (!items || saving || selectedCount === 0) return
-    setSaving(true)
-    setError(null)
-    setOkMsg(null)
-    try {
-      const selected = items.filter((it) => it.checked)
-      const res = await saveBatchItems(selected)
-      setOkMsg(`✅ 成功保存 ${res.saved} 条${res.failed > 0 ? `，${res.failed} 条失败` : ''}`)
-      window.dispatchEvent(new CustomEvent('dashboard-refresh'))
-      onSaved()
-      setItems(null)
-      setFileName('')
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '保存失败，请重试')
-    } finally {
-      setSaving(false)
-    }
-  }
-
   function resetAll() {
-    if (busy || saving) return
+    if (busy) return
     setItems(null)
     setFileName('')
     setError(null)
-    setOkMsg(null)
   }
 
   return (
@@ -187,100 +133,16 @@ export default function BatchImportTab({ onSaved }: Props) {
         </div>
       )}
 
-      {/* 保存成功提示 */}
-      {okMsg && (
-        <div style={{ marginTop: 14, padding: '12px 16px', background: '#ECFDF5', border: '1px solid #A7F3D0', borderRadius: 10, fontSize: 13, color: '#065F46', textAlign: 'left' }}>
-          {okMsg}
-        </div>
-      )}
-
-      {/* 预览列表 */}
+      {/* 预览列表（复用共享组件） */}
       {items && items.length > 0 && (
-        <div style={{ marginTop: 18 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-            <div style={{ fontSize: 14, fontWeight: 600, color: '#111111' }}>
-              {fileName || '账单'} · 识别出 <b style={{ color: '#0040FF' }}>{items.length}</b> 条
-            </div>
-            <button onClick={resetAll} style={{ fontSize: 12, color: '#A0A4A4', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--font-stack)' }}>
-              取消，重新选文件
-            </button>
-          </div>
-
-          <div style={{ border: '1px solid #C0C4C4', borderRadius: 14, overflow: 'hidden' }}>
-            {items.map((it, i) => (
-              <div key={it.uid} style={{
-                padding: '10px 12px',
-                borderBottom: i < items.length - 1 ? '1px solid #E4E6E6' : 'none',
-                background: it.checked ? '#FFFFFF' : '#E4E6E6',
-                opacity: it.checked ? 1 : 0.55,
-              }}>
-                {/* 行1：勾选 + 商家 + 金额 + 删除 */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                  <input type="checkbox" checked={it.checked} onChange={() => toggleItem(it.uid)}
-                    style={{ width: 16, height: 16, accentColor: '#0040FF', flexShrink: 0 }} />
-                  <div style={{ fontSize: 11, color: '#A0A4A4', flexShrink: 0 }}>
-                    {i + 1}. {it.txType === 'income' ? '收入' : '支出'}
-                  </div>
-                  <input value={it.merchant} placeholder="商家名称"
-                    onChange={(e) => updateItem(it.uid, { merchant: e.target.value })}
-                    style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
-                  <div style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>
-                    <span style={{ fontSize: 13, color: '#888888', marginRight: 4 }}>¥</span>
-                    <input value={it.amount ? String(it.amount) : ''} placeholder="0.00" inputMode="decimal"
-                      onChange={(e) => {
-                        const v = e.target.value
-                        if (/^\d*\.?\d{0,2}$/.test(v) || v === '') updateItem(it.uid, { amount: parseFloat(v) || 0 })
-                      }}
-                      style={{ ...inputStyle, width: 84, textAlign: 'right', fontWeight: 600 }} />
-                  </div>
-                  <button onClick={() => removeItem(it.uid)} title="删除这条"
-                    style={{ background: 'none', border: 'none', color: '#A0A4A4', fontSize: 15, cursor: 'pointer', padding: '2px 4px', fontFamily: 'var(--font-stack)', flexShrink: 0 }}>
-                    ✕
-                  </button>
-                </div>
-                {/* 行2：日期 + 分类 + 支付 + 备注 */}
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <input type="date" value={it.time}
-                    onChange={(e) => updateItem(it.uid, { time: e.target.value })}
-                    style={{ ...inputStyle, width: 148 }} />
-                  <select value={it.category} onChange={(e) => updateItem(it.uid, { category: e.target.value })}
-                    style={{ ...inputStyle, width: 104, background: '#D8DADA' }}>
-                    {catOptions.map((c) => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                  <select value={it.paymentMethod} onChange={(e) => updateItem(it.uid, { paymentMethod: e.target.value })}
-                    style={{ ...inputStyle, width: 104, background: '#D8DADA' }}>
-                    {LEDGER_PAYMENTS.map((p) => <option key={p} value={p}>{p}</option>)}
-                  </select>
-                  <input value={it.note} placeholder="备注（可选）"
-                    onChange={(e) => updateItem(it.uid, { note: e.target.value })}
-                    style={{ ...inputStyle, flex: 1, minWidth: 120 }} />
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* 全选 + 批量保存 */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 14 }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: '#374151', cursor: 'pointer' }}>
-              <input type="checkbox" checked={allChecked}
-                onChange={() => setItems((prev) => prev && prev.map((it) => ({ ...it, checked: !allChecked })))}
-                style={{ width: 16, height: 16, accentColor: '#0040FF' }} />
-              全选
-            </label>
-            <button onClick={handleSave} disabled={saving || selectedCount === 0} className="btn-primary"
-              style={{
-                flex: 1, padding: '12px 0', fontFamily: 'var(--font-stack)',
-                background: selectedCount === 0 ? '#C7D2FE' : '#0040FF', color: '#fff', border: 'none',
-                borderRadius: 12, fontSize: 14, fontWeight: 600,
-                cursor: selectedCount === 0 ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1,
-              }}>
-              {saving ? '⏳ 正在保存…' : `📥 批量保存（${selectedCount} 条）`}
-            </button>
-          </div>
-          <div style={{ marginTop: 8, fontSize: 12, color: '#A0A4A4', textAlign: 'center', lineHeight: 1.7 }}>
-            保存前可修改每条的日期、金额、商家、分类与支付方式；勾选状态决定哪些条目入库
-          </div>
-        </div>
+        <BatchPreviewList
+          items={items}
+          onChange={setItems}
+          onSaved={onSaved}
+          title={fileName || '账单'}
+          resetLabel="取消，重新选文件"
+          onReset={resetAll}
+        />
       )}
     </div>
   )
