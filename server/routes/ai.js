@@ -233,6 +233,10 @@ aiRouter.post('/extract', async (req, res) => {
     }
     if (!items || !Array.isArray(items)) return res.status(502).json({ error: 'PARSE_ERROR' })
 
+    // 服务端诊断日志：记录模型原始返回与识别条数，便于在 journalctl 里排查「只识别出 1 条」的问题
+    console.log(`[ai:extract] model=${cfg.modelName} source=${source} items=${items.length}`)
+    console.log(`[ai:extract] raw=${String(content).replace(/\s+/g, ' ').slice(0, 400)}`)
+
     res.json({ items })
   } catch (e) {
     res.status(500).json({ error: String(e?.message ?? e) })
