@@ -16,6 +16,8 @@ export interface ParsedLedgerItem {
   time: string // YYYY-MM-DD
   paymentMethod: string // 微信/支付宝/银行卡/现金/花呗/信用支付/先用后付/分期
   note: string
+  /** 收支类型（批量导入视觉路径用，便于收入/支出区分） */
+  txType?: 'income' | 'expense'
 }
 
 // 系统固定分类与支付方式（供确认卡片下拉）
@@ -457,7 +459,7 @@ export async function analyzeReceiptImage(imageDataUrls: string[]): Promise<Pars
 const MULTI_SYSTEM_MSG =
   '你是一个记账助手，负责从支付/交易截图或账单列表中提取所有账单记录。只输出 JSON，不要任何额外文字或解释。'
 const MULTI_ITEM_SCHEMA =
-  '{"amount": 金额（元，数字，必须识别出具体数值）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "交易日期（YYYY-MM-DD，无法确定用今天）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}'
+  '{"amount": 金额（元，数字，必须识别出具体数值）, "txType": "expense" 支出 或 "income" 收入（默认 "expense"）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "交易日期（YYYY-MM-DD，无法确定用今天）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}'
 const MULTI_COMMON_RULE =
   '要求：一张图/一份文件里可能出现 1~20 条记录，请逐条提取、不能合并也不能遗漏；跳过退款、手续费说明、合计/汇总行和无关文字；金额统一为正数。' +
   '返回格式（严格 JSON 对象）：{"items": [ {记录}, {记录}, ... ]}'
@@ -472,6 +474,12 @@ export async function analyzeReceiptImagesMulti(imageDataUrls: string[]): Promis
 
   const cfg = await getModelConfig()
   const vision = !!cfg && isVisionModel(cfg.modelName)
+
+  const toItem = (r: Record<string, unknown>): ParsedLedgerItem => ({
+    ...normalizeItem(r),
+    txType: String(r.txType ?? '').toLowerCase() === 'income' ? 'income' : 'expense',
+  })
+  const toItems = (rawList: Record<string, unknown>[]) => rawList.map(toItem).filter(it => it.amount > 0)
 
   // ---- 视觉模型：直接传图片 ----
   if (vision) {
@@ -492,7 +500,7 @@ export async function analyzeReceiptImagesMulti(imageDataUrls: string[]): Promis
     ], { json: true, temperature: 0.1 })
 
     const rawList = extractJsonList(content)
-    return rawList.map(r => normalizeItem(r)).filter(it => it.amount > 0)
+    return toItems(rawList)
   }
 
   // ---- 纯文本模型：本地 OCR 提取文字，再交给模型提取全部记录 ----
@@ -514,7 +522,7 @@ export async function analyzeReceiptImagesMulti(imageDataUrls: string[]): Promis
   ], { json: true, temperature: 0.1 })
 
   const rawList = extractJsonList(content)
-  return rawList.map(r => normalizeItem(r)).filter(it => it.amount > 0)
+  return toItems(rawList)
 }
 
 /** 测试连接结果 */

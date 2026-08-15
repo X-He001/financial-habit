@@ -67,12 +67,12 @@ function toBatchItem(raw: Record<string, unknown>): BatchItem {
   }
 }
 
-/** DeepSeek 视觉降级结果（ParsedLedgerItem[]）→ BatchItem[]（默认支出） */
+/** DeepSeek 视觉降级结果（ParsedLedgerItem[]）→ BatchItem[]（txType 透传，默认支出） */
 export function visionItemsToBatch(items: ParsedLedgerItem[]): BatchItem[] {
   return items.map((it) => ({
     uid: nextUid(),
     amount: it.amount,
-    txType: 'expense' as const,
+    txType: it.txType ?? 'expense',
     category: it.category,
     merchant: it.merchant,
     time: it.time,
