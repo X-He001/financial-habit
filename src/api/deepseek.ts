@@ -223,22 +223,129 @@ export async function agentCompletion(
   return { content: typeof content === 'string' ? content : null, toolCalls }
 }
 
-/** 从 AI 返回内容中提取 JSON 数组 */
-function parseJsonArray(content: string): Record<string, unknown>[] {
-  const cleaned = content.replace(/```json/gi, '').replace(/```/g, '').trim()
-  const arrStart = cleaned.indexOf('[')
-  const arrEnd = cleaned.lastIndexOf(']')
-  if (arrStart >= 0 && arrEnd > arrStart) {
-    const parsed = JSON.parse(cleaned.slice(arrStart, arrEnd + 1))
-    if (Array.isArray(parsed)) return parsed
+// ==================== 健壮 JSON 列表提取 ====================
+// 兼容模型在 json_object 模式下的各种包装形态：
+//  1) 顶层数组            [ {...}, {...} ]
+//  2) 包装对象            {"items": [...], "total": 2} / {"transactions": [...]} / {"result": [...]}
+//  3) 数字键对象          {"0": {...}, "1": {...}}
+//  4) 嵌套数组（按页返回） [[ {...} ], [ {...} ]]
+//  5) 单条记录对象        {"amount": 88.5, ...}
+// =====================================================================
+
+/** 递归把（可能嵌套的）数组拍平为纯对象列表 */
+function flattenList(v: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(v)) return []
+  const out: Record<string, unknown>[] = []
+  for (const item of v) {
+    if (Array.isArray(item)) out.push(...flattenList(item))
+    else if (item && typeof item === 'object') out.push(item as Record<string, unknown>)
   }
-  const objStart = cleaned.indexOf('{')
-  const objEnd = cleaned.lastIndexOf('}')
-  if (objStart >= 0 && objEnd > objStart) {
-    const parsed = JSON.parse(cleaned.slice(objStart, objEnd + 1))
-    return [parsed]
+  return out
+}
+
+/**
+ * 扫描字符串中最外层的成对 [ ]（跳过字符串里的括号），
+ * 对每个候选做 JSON 解析，返回「展开后条目最多」的那个数组（并列时取靠后者，
+ * 兼容 json_object 包装对象里真实数据字段在后的情况）。
+ */
+function extractOutermostArray(s: string): Record<string, unknown>[] | null {
+  const candidates: { start: number; parsed: unknown }[] = []
+  const stack: number[] = []
+  let inStr = false
+  let quote = ''
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (inStr) {
+      if (ch === '\\') { i++; continue }
+      if (ch === quote) inStr = false
+      continue
+    }
+    if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue }
+    if (ch === '[') stack.push(i)
+    else if (ch === ']' && stack.length > 0) {
+      const start = stack.pop()!
+      if (stack.length === 0) {
+        try {
+          const parsed = JSON.parse(s.slice(start, i + 1))
+          if (Array.isArray(parsed)) candidates.push({ start, parsed })
+        } catch { /* 忽略解析失败的候选 */ }
+      }
+    }
+  }
+  if (candidates.length === 0) return null
+  let best: { start: number; parsed: unknown } = candidates[0]
+  for (const c of candidates) {
+    const len = flattenList(c.parsed).length
+    const bestLen = flattenList(best.parsed).length
+    if (len > bestLen || (len === bestLen && c.start > best.start)) best = c
+  }
+  return flattenList(best.parsed)
+}
+
+/** 扫描字符串中最外层的成对 { }，解析为对象；失败返回 null */
+function tryParseOuterObject(s: string): Record<string, unknown> | null {
+  const stack: number[] = []
+  let inStr = false
+  let quote = ''
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (inStr) {
+      if (ch === '\\') { i++; continue }
+      if (ch === quote) inStr = false
+      continue
+    }
+    if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue }
+    if (ch === '{') stack.push(i)
+    else if (ch === '}' && stack.length > 0) {
+      const start = stack.pop()!
+      if (stack.length === 0) {
+        try {
+          const parsed = JSON.parse(s.slice(start, i + 1))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>
+          }
+        } catch { /* 忽略解析失败的候选 */ }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * 从 AI 返回内容中提取 JSON 对象数组（兼容多余文字/代码块/包装对象/嵌套数组/数字键对象/单条对象）。
+ * 解析失败抛 PARSE_ERROR。
+ */
+export function extractJsonList(content: string): Record<string, unknown>[] {
+  const cleaned = content.replace(/```json/gi, '').replace(/```/g, '').trim()
+
+  // 1) 数组（含被 {"items": [...]} 等包装的数组）
+  const arr = extractOutermostArray(cleaned)
+  if (arr !== null) return arr
+
+  // 2) 对象：包装对象 / 数字键对象 / 单条记录
+  const obj = tryParseOuterObject(cleaned)
+  if (obj) {
+    // 2a) 包装对象：取第一个数组值（items/transactions/records/result/data…）
+    for (const v of Object.values(obj)) {
+      if (Array.isArray(v)) return flattenList(v)
+    }
+    // 2b) 数字键对象：按 key 数值顺序取值
+    const keys = Object.keys(obj)
+    if (keys.length > 0 && keys.every((k) => /^\d+$/.test(k))) {
+      return keys
+        .sort((a, b) => Number(a) - Number(b))
+        .map((k) => obj[k])
+        .filter((v): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v))
+    }
+    // 2c) 单条记录对象
+    return [obj]
   }
   throw new Error('PARSE_ERROR')
+}
+
+/** 从 AI 返回内容中提取 JSON 数组（旧内部函数名，内部调用走 extractJsonList） */
+function parseJsonArray(content: string): Record<string, unknown>[] {
+  return extractJsonList(content)
 }
 
 function todayStr(): string {
@@ -342,6 +449,72 @@ export async function analyzeReceiptImage(imageDataUrls: string[]): Promise<Pars
 
   const rawList = parseJsonArray(content)
   return rawList.map(r => normalizeItem(r))
+}
+
+// ---- 多记录提取（一张图/一份文件里可能有多条账单） ----
+
+/** 多记录提取的公共提示语（要求返回 {"items": [...]}，兼容 json_object 模式） */
+const MULTI_SYSTEM_MSG =
+  '你是一个记账助手，负责从支付/交易截图或账单列表中提取所有账单记录。只输出 JSON，不要任何额外文字或解释。'
+const MULTI_ITEM_SCHEMA =
+  '{"amount": 金额（元，数字，必须识别出具体数值）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "交易日期（YYYY-MM-DD，无法确定用今天）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}'
+const MULTI_COMMON_RULE =
+  '要求：一张图/一份文件里可能出现 1~20 条记录，请逐条提取、不能合并也不能遗漏；跳过退款、手续费说明、合计/汇总行和无关文字；金额统一为正数。' +
+  '返回格式（严格 JSON 对象）：{"items": [ {记录}, {记录}, ... ]}'
+
+/**
+ * 批量识别支付/交易截图中的「所有」账单记录（每张图可能含 1~20 条，全部合并返回）。
+ * 模型支持视觉 → 直接传图片；纯文本模型 → 先本地 OCR 提取文字再交给模型。
+ * 过滤掉金额为 0 的无效条目（模型没识别出金额的算失败）。
+ */
+export async function analyzeReceiptImagesMulti(imageDataUrls: string[]): Promise<ParsedLedgerItem[]> {
+  if (imageDataUrls.length === 0) throw new Error('EMPTY_IMAGES')
+
+  const cfg = await getModelConfig()
+  const vision = !!cfg && isVisionModel(cfg.modelName)
+
+  // ---- 视觉模型：直接传图片 ----
+  if (vision) {
+    const content = await chatCompletion([
+      { role: 'system', content: MULTI_SYSTEM_MSG },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text:
+              `以下是 ${imageDataUrls.length} 张交易截图，请识别其中出现的所有交易记录（每张图可能有 1~20 条），全部提取后合并为一个列表返回。\n` +
+              `${MULTI_COMMON_RULE}\n每条记录格式：${MULTI_ITEM_SCHEMA}`,
+          },
+          ...imageDataUrls.map(url => ({ type: 'image_url', image_url: { url } })),
+        ],
+      },
+    ], { json: true, temperature: 0.1 })
+
+    const rawList = extractJsonList(content)
+    return rawList.map(r => normalizeItem(r)).filter(it => it.amount > 0)
+  }
+
+  // ---- 纯文本模型：本地 OCR 提取文字，再交给模型提取全部记录 ----
+  const texts: string[] = []
+  for (const url of imageDataUrls) {
+    try { texts.push(await ocrImageDataUrl(url)) } catch { texts.push('') }
+  }
+  if (texts.every(t => !t.trim())) throw new VisionUnsupportedError()
+
+  const content = await chatCompletion([
+    { role: 'system', content: MULTI_SYSTEM_MSG },
+    {
+      role: 'user',
+      content:
+        `以下是 ${texts.length} 张交易截图 OCR 识别出的文字（按图片顺序），请提取其中出现的所有交易记录（一张图可能有 1~20 条），全部提取后合并为一个列表返回。\n` +
+        `${MULTI_COMMON_RULE}\n每条记录格式：${MULTI_ITEM_SCHEMA}\n\n` +
+        texts.map((t, i) => `【第 ${i + 1} 张】\n${t || '（未能识别出文字）'}`).join('\n\n'),
+    },
+  ], { json: true, temperature: 0.1 })
+
+  const rawList = extractJsonList(content)
+  return rawList.map(r => normalizeItem(r)).filter(it => it.amount > 0)
 }
 
 /** 测试连接结果 */

@@ -59,7 +59,8 @@ function readModelConfig() {
   return null
 }
 
-const SYSTEM_PROMPT = `你是一个记账助手。用户会给你一份账单的原始文本（可能来自 Excel 表格、PDF 账单或 OCR 截图识别），里面可能包含一条或多条交易记录。请把所有交易记录逐条提取出来，整理成结构化 JSON 数组返回，不要输出任何其他文字。
+const SYSTEM_PROMPT = `你是一个记账助手。用户会给你一份账单的原始文本（可能来自 Excel 表格、PDF 账单或 OCR 截图识别），里面可能包含一条或多条交易记录。请把所有交易记录逐条提取出来，不能合并也不能遗漏。
+只输出一个严格 JSON 对象：{"items": [ {记录}, {记录}, ... ]}，不要输出任何其他文字。
 
 每条记录的格式：
 {"amount": 金额（元，数字）, "txType": "expense" 支出 或 "income" 收入（无法判断时默认 "expense"）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称或交易对方（未知填 未知商家）", "time": "交易日期（YYYY-MM-DD，无法确定日期用今天）", "paymentMethod": "微信|支付宝|银行卡|现金|花呗|信用支付|先用后付|分期", "note": "备注或空字符串"}
@@ -73,20 +74,97 @@ const SYSTEM_PROMPT = `你是一个记账助手。用户会给你一份账单的
 
 export const aiRouter = Router()
 
-/** 从模型返回内容里提取 JSON 数组（兼容输出多余文字/代码块） */
+/** 递归把（可能嵌套的）数组拍平为纯对象列表 */
+function flattenList(v) {
+  if (!Array.isArray(v)) return []
+  const out = []
+  for (const item of v) {
+    if (Array.isArray(item)) out.push(...flattenList(item))
+    else if (item && typeof item === 'object') out.push(item)
+  }
+  return out
+}
+
+/**
+ * 从模型返回内容里提取 JSON 对象数组（兼容多余文字/代码块/包装对象/嵌套数组/数字键对象/单条对象）：
+ *  1) 顶层数组              [ {...}, {...} ]
+ *  2) 包装对象              {"items": [...], "total": 2} / {"transactions": [...]}
+ *  3) 数字键对象            {"0": {...}, "1": {...}}
+ *  4) 嵌套数组（按页返回）   [[ {...} ], [ {...} ]]
+ *  5) 单条记录对象          {"amount": 88.5, ...}
+ */
 function extractJsonArray(content) {
   const cleaned = content.replace(/```json/gi, '').replace(/```/g, '').trim()
-  const arrStart = cleaned.indexOf('[')
-  const arrEnd = cleaned.lastIndexOf(']')
-  if (arrStart >= 0 && arrEnd > arrStart) {
-    const parsed = JSON.parse(cleaned.slice(arrStart, arrEnd + 1))
-    if (Array.isArray(parsed)) return parsed
+
+  // 1) 数组（含被 {"items": [...]} 等包装的数组）：扫描最外层 []，取「展开后条目最多」的候选（并列取靠后者）
+  const arrCandidates = []
+  const arrStack = []
+  let inStr = false
+  let quote = ''
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i]
+    if (inStr) {
+      if (ch === '\\') { i++; continue }
+      if (ch === quote) inStr = false
+      continue
+    }
+    if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue }
+    if (ch === '[') arrStack.push(i)
+    else if (ch === ']' && arrStack.length > 0) {
+      const start = arrStack.pop()
+      if (arrStack.length === 0) {
+        try {
+          const parsed = JSON.parse(cleaned.slice(start, i + 1))
+          if (Array.isArray(parsed)) arrCandidates.push({ start, list: flattenList(parsed) })
+        } catch { /* 忽略解析失败的候选 */ }
+      }
+    }
   }
-  const objStart = cleaned.indexOf('{')
-  const objEnd = cleaned.lastIndexOf('}')
-  if (objStart >= 0 && objEnd > objStart) {
-    const parsed = JSON.parse(cleaned.slice(objStart, objEnd + 1))
-    return [parsed]
+  if (arrCandidates.length > 0) {
+    let best = null
+    for (const c of arrCandidates) {
+      if (!best || c.list.length > best.list.length || (c.list.length === best.list.length && c.start > best.start)) best = c
+    }
+    if (best && best.list.length > 0) return best.list
+  }
+
+  // 2) 对象：包装对象 / 数字键对象 / 单条记录
+  const objStack = []
+  inStr = false
+  quote = ''
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i]
+    if (inStr) {
+      if (ch === '\\') { i++; continue }
+      if (ch === quote) inStr = false
+      continue
+    }
+    if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue }
+    if (ch === '{') objStack.push(i)
+    else if (ch === '}' && objStack.length > 0) {
+      const start = objStack.pop()
+      if (objStack.length === 0) {
+        try {
+          const parsed = JSON.parse(cleaned.slice(start, i + 1))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            // 2a) 包装对象：取第一个数组值
+            for (const v of Object.values(parsed)) {
+              if (Array.isArray(v)) return flattenList(v)
+            }
+            // 2b) 数字键对象：按 key 数值顺序取值
+            const keys = Object.keys(parsed)
+            if (keys.length > 0 && keys.every(k => /^\d+$/.test(k))) {
+              return keys
+                .sort((a, b) => Number(a) - Number(b))
+                .map(k => parsed[k])
+                .filter(v => v && typeof v === 'object' && !Array.isArray(v))
+            }
+            // 2c) 单条记录对象
+            return [parsed]
+          }
+        } catch { /* 忽略解析失败的候选 */ }
+      }
+    }
   }
   return null
 }

@@ -121,7 +121,7 @@ export default function BatchImportTab({ onSaved }: Props) {
           </div>
         ))}
         <div style={{ fontSize: 11.5, color: '#6B7280', marginTop: 6, lineHeight: 1.7 }}>
-          支持一份文件含多条记录；单文件 ≤10MB；图片会先本地 OCR 再让 AI 整理，首次使用需联网下载识别模型。
+          支持一份文件含多条记录；单文件 ≤10MB；图片优先用视觉模型直接识别（纯文本模型会先本地 OCR 再让 AI 整理，首次使用需联网下载识别模型）。
         </div>
       </div>
 

@@ -8,8 +8,9 @@
 import type { Transaction } from '../types'
 import { addTransaction } from '../db/crud'
 import { guardTransaction } from './impulseEngine'
-import { chatCompletion, analyzeReceiptImage, normalizeItem } from '../api/deepseek'
+import { chatCompletion, analyzeReceiptImagesMulti, normalizeItem, extractJsonList } from '../api/deepseek'
 import type { ParsedLedgerItem } from '../api/deepseek'
+import { getModelConfig, isVisionModel } from '../api/modelConfig'
 import { ocrImageDataUrl } from './ocr'
 import { getBaseUrl } from '../sync/api'
 
@@ -48,24 +49,6 @@ function fileToDataUrl(file: File): Promise<string> {
     reader.onerror = reject
     reader.readAsDataURL(file)
   })
-}
-
-/** 从 AI 返回内容中提取 JSON 数组（兼容多余文字/代码块） */
-function extractJsonArray(content: string): Record<string, unknown>[] {
-  const cleaned = content.replace(/```json/gi, '').replace(/```/g, '').trim()
-  const arrStart = cleaned.indexOf('[')
-  const arrEnd = cleaned.lastIndexOf(']')
-  if (arrStart >= 0 && arrEnd > arrStart) {
-    const parsed = JSON.parse(cleaned.slice(arrStart, arrEnd + 1))
-    if (Array.isArray(parsed)) return parsed
-  }
-  const objStart = cleaned.indexOf('{')
-  const objEnd = cleaned.lastIndexOf('}')
-  if (objStart >= 0 && objEnd > objStart) {
-    const parsed = JSON.parse(cleaned.slice(objStart, objEnd + 1))
-    return [parsed]
-  }
-  throw new Error('PARSE_ERROR')
 }
 
 /** 把 AI 原始返回规整为 BatchItem（时间/金额/分类兜底，支持 txType） */
@@ -152,19 +135,42 @@ async function extractPdf(file: File, onProgress: ParseProgress): Promise<{ text
   return { text: parts.join('\n') }
 }
 
-/** 截图/图片：Tesseract.js 本地 OCR 提取文字；OCR 不可用时降级 DeepSeek 视觉识别 */
+/**
+ * 截图/图片：
+ *  1) 视觉模型优先：直接识别图中所有账单记录（一张图可能 1~20 条）
+ *  2) 纯文本模型：Tesseract.js 本地 OCR 提取文字，再交 AI 整理
+ *  3) OCR 失败 → 交给 AI 再试一次（视觉模型直传图；纯文本模型内部二次 OCR）
+ */
 async function extractImage(file: File, onProgress: ParseProgress): Promise<{ text: string; visionItems?: ParsedLedgerItem[] }> {
   const dataUrl = await fileToDataUrl(file)
+
+  // 1) 视觉模型：直接识别图片中的所有记录
+  const cfg = await getModelConfig()
+  if (cfg && isVisionModel(cfg.modelName)) {
+    try {
+      onProgress('正在让 AI 识别图片中的所有账单…', 20)
+      const items = await analyzeReceiptImagesMulti([dataUrl])
+      if (items.length > 0) {
+        onProgress('视觉识别完成', 100)
+        return { text: '', visionItems: items }
+      }
+      throw new Error('EMPTY_RESULT')
+    } catch {
+      // 视觉失败/没识别到 → 降级本地 OCR
+    }
+  }
+
+  // 2) 纯文本模型（或视觉失败）：先本地 OCR 再交 AI 整理
   try {
     const text = await ocrImageDataUrl(dataUrl, onProgress)
     if (!text) throw new Error('图片里没有识别到文字，请换一张更清晰的截图')
     onProgress('OCR 识别完成', 100)
     return { text }
   } catch {
-    // OCR 不可用（模型下载失败/网络受限）→ 降级 DeepSeek 视觉识别
-    onProgress('OCR 引擎不可用，改用 AI 视觉识别…', 10)
-    const items = await analyzeReceiptImage([dataUrl])
-    onProgress('视觉识别完成', 100)
+    // 3) OCR 不可用 → 交给 AI 再试一次
+    onProgress('OCR 引擎不可用，改用 AI 识别…', 10)
+    const items = await analyzeReceiptImagesMulti([dataUrl])
+    onProgress('识别完成', 100)
     return { text: '', visionItems: items }
   }
 }
@@ -186,7 +192,8 @@ async function extractTextFromFile(file: File, onProgress: ParseProgress): Promi
 
 /** 与后端 server/routes/ai.js 的 SYSTEM_PROMPT 保持一致（前端直连兜底时使用） */
 const STRUCTURE_SYSTEM =
-  '你是一个记账助手。用户会给你一份账单的原始文本（可能来自 Excel 表格、PDF 账单或 OCR 截图识别），里面可能包含一条或多条交易记录。请把所有交易记录逐条提取出来，整理成结构化 JSON 数组返回，不要输出任何其他文字。' +
+  '你是一个记账助手。用户会给你一份账单的原始文本（可能来自 Excel 表格、PDF 账单或 OCR 截图识别），里面可能包含一条或多条交易记录。请把所有交易记录逐条提取出来，不能合并也不能遗漏。' +
+  '只输出一个严格 JSON 对象：{"items": [ {记录}, {记录}, ... ]}，不要输出任何其他文字。' +
   '每条记录格式：{"amount": 金额（元，数字）, "txType": "expense" 支出或 "income" 收入（无法判断默认 "expense"）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称或交易对方（未知填 未知商家）", "time": "YYYY-MM-DD（无法确定用今天）", "paymentMethod": "微信|支付宝|银行卡|现金|花呗|信用支付|先用后付|分期", "note": "备注或空字符串"}。' +
   '要求：逐条提取不合并不遗漏（原始数据有 5 笔就输出 5 条）；金额取实际交易金额统一为正数；跳过退款、手续费说明、合计/汇总行和无关说明；时间优先用原始数据里的日期，格式 YYYY-MM-DD。'
 
@@ -241,7 +248,7 @@ export async function structureTextToItems(
     { role: 'system', content: STRUCTURE_SYSTEM },
     { role: 'user', content: `账单来源：${source}\n\n账单原始内容：\n"""${text.slice(0, 20_000)}"""` },
   ], { json: true, temperature: 0.1 })
-  const list = extractJsonArray(content)
+  const list = extractJsonList(content)
   return list.map((r) => toBatchItem(r))
 }
 
