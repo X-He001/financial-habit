@@ -150,13 +150,15 @@ async function extractImage(file: File, onProgress: ParseProgress): Promise<{ te
     try {
       onProgress('正在让 AI 识别图片中的所有账单…', 20)
       const items = await analyzeReceiptImagesMulti([dataUrl])
+      console.info(`[批量导入] 视觉路径完成，共 ${items.length} 条`)
       if (items.length > 0) {
         onProgress('视觉识别完成', 100)
         return { text: '', visionItems: items }
       }
       throw new Error('EMPTY_RESULT')
-    } catch {
+    } catch (e) {
       // 视觉失败/没识别到 → 降级本地 OCR
+      console.info('[批量导入] 视觉路径失败，降级 OCR:', e)
     }
   }
 
@@ -164,12 +166,14 @@ async function extractImage(file: File, onProgress: ParseProgress): Promise<{ te
   try {
     const text = await ocrImageDataUrl(dataUrl, onProgress)
     if (!text) throw new Error('图片里没有识别到文字，请换一张更清晰的截图')
+    console.info('[批量导入] 走 OCR + AI 整理路径')
     onProgress('OCR 识别完成', 100)
     return { text }
   } catch {
     // 3) OCR 不可用 → 交给 AI 再试一次
     onProgress('OCR 引擎不可用，改用 AI 识别…', 10)
     const items = await analyzeReceiptImagesMulti([dataUrl])
+    console.info(`[批量导入] OCR 不可用，AI 兜底返回 ${items.length} 条`)
     onProgress('识别完成', 100)
     return { text: '', visionItems: items }
   }

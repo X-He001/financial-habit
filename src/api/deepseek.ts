@@ -360,7 +360,10 @@ export function normalizeItem(raw: Record<string, unknown> | null | undefined): 
   if (!raw) {
     return { amount: 0, category: '其他', merchant: '', time: todayStr(), paymentMethod: '微信', note: '' }
   }
-  const amount = Math.max(0, parseFloat(String(raw.amount)) || 0)
+  // 金额：容忍 "-38" / "¥38.00" / "-¥38" / "3,200" 等真实截图写法；
+  // 负号表示支出，取绝对值后作为金额，避免被 parseFloat 解析成 0 或 NaN 而整条丢弃
+  const amt = parseFloat(String(raw.amount ?? '').replace(/[^\d.-]/g, ''))
+  const amount = Number.isFinite(amt) ? Math.abs(amt) : 0
   const category = LEDGER_CATEGORIES.includes(String(raw.category)) ? String(raw.category) : '其他'
   const paymentMethod = LEDGER_PAYMENTS.includes(String(raw.paymentMethod)) ? String(raw.paymentMethod) : '微信'
   // 时间：优先匹配 YYYY-MM-DD
@@ -461,7 +464,7 @@ const MULTI_SYSTEM_MSG =
 const MULTI_ITEM_SCHEMA =
   '{"amount": 金额（元，数字，必须识别出具体数值）, "txType": "expense" 支出 或 "income" 收入（默认 "expense"）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "交易日期（YYYY-MM-DD，无法确定用今天）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}'
 const MULTI_COMMON_RULE =
-  '要求：一张图/一份文件里可能出现 1~20 条记录，请逐条提取、不能合并也不能遗漏；跳过退款、手续费说明、合计/汇总行和无关文字；金额统一为正数。' +
+  '要求：一张图/一份文件里可能出现 1~20 条记录，请先数清楚图里有几条记录，再逐条全部提取（图里有 N 条就必须输出 N 个对象），不能合并、不能遗漏、严禁只输出第一条或随意截断；跳过退款、手续费说明、合计/汇总行和无关文字；金额统一为正数（图中 "-38.00" 这样的支出也输出 38，不要带负号和货币符号）。' +
   '返回格式（严格 JSON 对象）：{"items": [ {记录}, {记录}, ... ]}'
 
 /**
@@ -481,26 +484,46 @@ export async function analyzeReceiptImagesMulti(imageDataUrls: string[]): Promis
   })
   const toItems = (rawList: Record<string, unknown>[]) => rawList.map(toItem).filter(it => it.amount > 0)
 
-  // ---- 视觉模型：直接传图片 ----
-  if (vision) {
+  const buildUserText = (ocrHint?: string) =>
+    `以下是 ${imageDataUrls.length} 张交易截图，请识别其中出现的所有交易记录（每张图可能有 1~20 条），全部提取后合并为一个列表返回。\n` +
+    `${MULTI_COMMON_RULE}\n每条记录格式：${MULTI_ITEM_SCHEMA}` +
+    (ocrHint
+      ? `\n\n重要：上一轮只识别到 1 条，但图片里应该有多条记录。请重新仔细识别，务必输出全部记录。\n以下是该图 OCR 识别出的文字（仅作辅助参考，可能不完整，以图片为准）：\n${ocrHint.slice(0, 3000)}`
+      : '')
+
+  const visionCall = async (ocrHint?: string): Promise<ParsedLedgerItem[]> => {
     const content = await chatCompletion([
       { role: 'system', content: MULTI_SYSTEM_MSG },
       {
         role: 'user',
         content: [
-          {
-            type: 'text',
-            text:
-              `以下是 ${imageDataUrls.length} 张交易截图，请识别其中出现的所有交易记录（每张图可能有 1~20 条），全部提取后合并为一个列表返回。\n` +
-              `${MULTI_COMMON_RULE}\n每条记录格式：${MULTI_ITEM_SCHEMA}`,
-          },
+          { type: 'text', text: buildUserText(ocrHint) },
           ...imageDataUrls.map(url => ({ type: 'image_url', image_url: { url } })),
         ],
       },
     ], { json: true, temperature: 0.1 })
+    return toItems(extractJsonList(content))
+  }
 
-    const rawList = extractJsonList(content)
-    return toItems(rawList)
+  // ---- 视觉模型：直接传图片 ----
+  if (vision) {
+    let items = await visionCall()
+    console.info(`[批量导入] 视觉模型第一轮返回 ${items.length} 条`)
+    // 兜底：只识别出 ≤1 条时，附上 OCR 文字重试一次，防止模型漏提
+    if (items.length <= 1) {
+      let ocrText = ''
+      try { ocrText = await ocrImageDataUrl(imageDataUrls[0]) } catch { /* 忽略 OCR 失败 */ }
+      if (ocrText.trim()) {
+        try {
+          const retryItems = await visionCall(ocrText)
+          console.info(`[批量导入] 视觉模型第二轮（带 OCR 提示）返回 ${retryItems.length} 条`)
+          if (retryItems.length > items.length) items = retryItems
+        } catch (e) {
+          console.info('[批量导入] 视觉模型重试失败，保留第一轮结果:', e)
+        }
+      }
+    }
+    return items
   }
 
   // ---- 纯文本模型：本地 OCR 提取文字，再交给模型提取全部记录 ----
