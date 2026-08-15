@@ -1,13 +1,14 @@
 // =====================================================================
 // AI 代理路由（server/routes/ai.js）
-// 用途：智能记账「批量导入」的后端代理。
+// 用途：智能记账「批量导入」的后端代理 + 统一对话接口。
 // 前端把文件解析出的原始文本（Excel/PDF/OCR）POST 到这里，
-// 服务端读取 settings 表里的 DeepSeek API Key 调模型做结构化提取，
-// 避免在前端暴露 Key。
+// 服务端读取 settings 表里的模型配置（modelConfig，兼容旧版 deepseekApiKey）
+// 调对应厂商的 OpenAI 兼容 /chat/completions 接口，避免在前端暴露 Key。
 //
 // 约定：
 //   POST /api/ai/extract  { text, source } → { items: [...] }
-//   409 MISSING_KEY  服务器 settings 表里没有 Key（前端可降级为直连调用）
+//   POST /api/ai/chat     { messages }     → { content }
+//   409 MISSING_KEY/MISSING_CONFIG  服务器 settings 表里没有模型配置（前端可降级为直连调用）
 //   401 INVALID_KEY  Key 无效
 //   402 BALANCE      余额不足
 //   502 AI_*         AI 服务错误（网络/上游 4xx/5xx/空响应/解析失败）
@@ -15,10 +16,48 @@
 import { Router } from 'express'
 import { db } from '../db.js'
 
-const API_BASE = 'https://api.deepseek.com'
-const MODEL = 'deepseek-chat'
 const TIMEOUT_MS = 60_000
 const MAX_TEXT_LEN = 20_000 // 超出截断，避免超长输入浪费 token
+
+/**
+ * 读取服务器 settings 表里的模型配置。
+ * 优先 modelConfig（JSON：{ provider, modelName, apiUrl, apiKey }），
+ * 兼容旧版 deepseekApiKey（自动映射为 DeepSeek 配置）。
+ * 无配置返回 null。
+ */
+function readModelConfig() {
+  const row = db.prepare(`SELECT value FROM settings WHERE key = 'modelConfig'`).get()
+  if (row?.value) {
+    try {
+      const cfg = JSON.parse(row.value)
+      if (
+        cfg &&
+        String(cfg.apiUrl || '').trim() &&
+        String(cfg.modelName || '').trim() &&
+        String(cfg.apiKey || '').trim()
+      ) {
+        return {
+          provider: String(cfg.provider || 'custom'),
+          modelName: String(cfg.modelName).trim(),
+          apiUrl: String(cfg.apiUrl).trim().replace(/\/+$/, ''),
+          apiKey: String(cfg.apiKey).trim(),
+        }
+      }
+    } catch {
+      // 配置数据损坏则忽略，走旧版兼容
+    }
+  }
+  const old = db.prepare(`SELECT value FROM settings WHERE key = 'deepseekApiKey'`).get()
+  if (old?.value && String(old.value).trim()) {
+    return {
+      provider: 'deepseek',
+      modelName: 'deepseek-v4-flash',
+      apiUrl: 'https://api.deepseek.com',
+      apiKey: String(old.value).trim(),
+    }
+  }
+  return null
+}
 
 const SYSTEM_PROMPT = `你是一个记账助手。用户会给你一份账单的原始文本（可能来自 Excel 表格、PDF 账单或 OCR 截图识别），里面可能包含一条或多条交易记录。请把所有交易记录逐条提取出来，整理成结构化 JSON 数组返回，不要输出任何其他文字。
 
@@ -55,10 +94,9 @@ function extractJsonArray(content) {
 /** POST /api/ai/extract：把原始账单文本结构化提取为记账条目数组 */
 aiRouter.post('/extract', async (req, res) => {
   try {
-    // 1. Key：只从服务器 settings 表读取，前端拿不到
-    const row = db.prepare(`SELECT value FROM settings WHERE key = 'deepseekApiKey'`).get()
-    const key = row?.value
-    if (!key || !String(key).trim()) {
+    // 1. 模型配置：只从服务器 settings 表读取，前端拿不到 Key
+    const cfg = readModelConfig()
+    if (!cfg) {
       return res.status(409).json({ error: 'MISSING_KEY' })
     }
 
@@ -70,26 +108,29 @@ aiRouter.post('/extract', async (req, res) => {
       ? `${text.slice(0, MAX_TEXT_LEN)}\n…（内容过长已截断）`
       : text
 
-    // 3. 调 DeepSeek
+    // 3. 调模型（OpenAI 兼容；部分厂商不支持 response_format 时自动去掉重试）
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: `账单来源：${source}\n\n账单原始内容：\n"""${clipped}"""` },
+    ]
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
+    const doFetch = (withJson) => fetch(`${cfg.apiUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+      body: JSON.stringify({
+        model: cfg.modelName,
+        messages,
+        temperature: 0.1,
+        stream: false,
+        ...(withJson ? { response_format: { type: 'json_object' } } : {}),
+      }),
+      signal: controller.signal,
+    })
     let resp
     try {
-      resp = await fetch(`${API_BASE}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${String(key).trim()}` },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: `账单来源：${source}\n\n账单原始内容：\n"""${clipped}"""` },
-          ],
-          temperature: 0.1,
-          stream: false,
-          response_format: { type: 'json_object' },
-        }),
-        signal: controller.signal,
-      })
+      resp = await doFetch(true)
+      if (resp.status === 400) resp = await doFetch(false)
     } catch {
       return res.status(502).json({ error: 'AI_NETWORK_ERROR' })
     } finally {
@@ -115,6 +156,54 @@ aiRouter.post('/extract', async (req, res) => {
     if (!items || !Array.isArray(items)) return res.status(502).json({ error: 'PARSE_ERROR' })
 
     res.json({ items })
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e) })
+  }
+})
+
+/** POST /api/ai/chat：统一对话接口，从 settings 表读 modelConfig 动态选模型 */
+aiRouter.post('/chat', async (req, res) => {
+  try {
+    const cfg = readModelConfig()
+    if (!cfg) {
+      return res.status(409).json({ error: 'MISSING_CONFIG' })
+    }
+    const messages = req.body?.messages
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'EMPTY_MESSAGES' })
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
+    let resp
+    try {
+      resp = await fetch(`${cfg.apiUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+        body: JSON.stringify({
+          model: cfg.modelName,
+          messages,
+          temperature: 0.3,
+          stream: false,
+        }),
+        signal: controller.signal,
+      })
+    } catch {
+      return res.status(502).json({ error: 'AI_NETWORK_ERROR' })
+    } finally {
+      clearTimeout(timer)
+    }
+
+    if (resp.status === 401) return res.status(401).json({ error: 'INVALID_KEY' })
+    if (resp.status === 402) return res.status(402).json({ error: 'BALANCE' })
+    if (!resp.ok) return res.status(502).json({ error: `AI_API_ERROR:${resp.status}` })
+
+    const data = await resp.json().catch(() => null)
+    const content = data?.choices?.[0]?.message?.content
+    if (typeof content !== 'string' || !content.trim()) {
+      return res.status(502).json({ error: 'EMPTY_RESPONSE' })
+    }
+    res.json({ content })
   } catch (e) {
     res.status(500).json({ error: String(e?.message ?? e) })
   }

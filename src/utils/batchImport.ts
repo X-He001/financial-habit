@@ -10,6 +10,7 @@ import { addTransaction } from '../db/crud'
 import { guardTransaction } from './impulseEngine'
 import { chatCompletion, analyzeReceiptImage, normalizeItem } from '../api/deepseek'
 import type { ParsedLedgerItem } from '../api/deepseek'
+import { ocrImageDataUrl } from './ocr'
 import { getBaseUrl } from '../sync/api'
 
 // ==================== 类型 ====================
@@ -155,22 +156,7 @@ async function extractPdf(file: File, onProgress: ParseProgress): Promise<{ text
 async function extractImage(file: File, onProgress: ParseProgress): Promise<{ text: string; visionItems?: ParsedLedgerItem[] }> {
   const dataUrl = await fileToDataUrl(file)
   try {
-    onProgress('正在加载 OCR 识别引擎（首次使用需联网下载识别模型，请耐心等待）…', 5)
-    const Tesseract = await import('tesseract.js')
-    const worker = await Tesseract.createWorker('chi_sim+eng', 1, {
-      logger: (m) => {
-        if (!m || typeof m.progress !== 'number') return
-        if (m.status === 'recognizing text') {
-          onProgress(`OCR 识别中… ${Math.round(m.progress * 100)}%`, Math.round(m.progress * 80) + 15)
-        } else {
-          onProgress(`OCR 准备中（${m.status}）…`, 5)
-        }
-      },
-    })
-    onProgress('正在识别图片文字…', 15)
-    const { data } = await worker.recognize(dataUrl)
-    await worker.terminate()
-    const text = (data.text || '').trim()
+    const text = await ocrImageDataUrl(dataUrl, onProgress)
     if (!text) throw new Error('图片里没有识别到文字，请换一张更清晰的截图')
     onProgress('OCR 识别完成', 100)
     return { text }

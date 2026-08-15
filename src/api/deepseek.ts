@@ -1,10 +1,11 @@
-import { getSetting } from '../db/crud'
+import { getModelConfig, isVisionModel, DEEPSEEK_API_KEY } from './modelConfig'
+import type { ModelConfig } from './modelConfig'
+import { ocrImageDataUrl } from '../utils/ocr'
 
 // ==================== 常量 ====================
 
-export const DEEPSEEK_API_KEY = 'deepseekApiKey' // settings 表中的 key
-export const API_BASE = 'https://api.deepseek.com'
-export const MODEL = 'deepseek-chat'
+// 旧版设置项 key（自动迁移用）；新配置统一存 modelConfig（见 src/api/modelConfig.ts）
+export { DEEPSEEK_API_KEY }
 const REQUEST_TIMEOUT_MS = 30_000 // 所有 AI 调用统一 30 秒超时
 
 // 结构化记账返回
@@ -31,10 +32,9 @@ export class VisionUnsupportedError extends Error {
 
 // ==================== Key 检查 ====================
 
-/** 检查是否已配置 API Key，未配置返回 false */
+/** 检查是否已配置 AI 模型（有有效 API Key），未配置返回 false */
 export async function hasApiKey(): Promise<boolean> {
-  const key = await getSetting(DEEPSEEK_API_KEY)
-  return typeof key === 'string' && key.trim().length > 0
+  return (await getModelConfig()) !== null
 }
 
 // ==================== 内部工具 ====================
@@ -65,8 +65,8 @@ export interface ChatCompletionOptions {
 }
 
 async function getApiKey(): Promise<string | null> {
-  const key = await getSetting(DEEPSEEK_API_KEY)
-  return typeof key === 'string' && key.trim() ? key.trim() : null
+  const cfg = await getModelConfig()
+  return cfg?.apiKey ?? null
 }
 
 /**
@@ -77,8 +77,10 @@ export async function chatCompletion(
   messages: ChatMessage[],
   options: ChatCompletionOptions = {}
 ): Promise<string> {
-  const key = await getApiKey()
-  if (!key) throw new Error('NO_API_KEY')
+  const cfg = await getModelConfig()
+  if (!cfg) throw new Error('NO_API_KEY')
+  const key = cfg.apiKey
+  const apiUrl = cfg.apiUrl.replace(/\/+$/, '')
 
   const useStream = typeof options.onChunk === 'function'
   const controller = new AbortController()
@@ -86,7 +88,7 @@ export async function chatCompletion(
   const timer = setTimeout(() => { timedOut = true; controller.abort() }, REQUEST_TIMEOUT_MS)
 
   const body: Record<string, unknown> = {
-    model: MODEL,
+    model: cfg.modelName,
     messages,
     temperature: options.temperature ?? 0.3,
     stream: useStream,
@@ -95,7 +97,7 @@ export async function chatCompletion(
 
   let resp: Response
   try {
-    resp = await fetch(`${API_BASE}/chat/completions`, {
+    resp = await fetch(`${apiUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify(body),
@@ -179,8 +181,10 @@ export async function agentCompletion(
   tools: ChatTool[],
   options: { temperature?: number } = {}
 ): Promise<AgentTurnResult> {
-  const key = await getApiKey()
-  if (!key) throw new Error('NO_API_KEY')
+  const cfg = await getModelConfig()
+  if (!cfg) throw new Error('NO_API_KEY')
+  const key = cfg.apiKey
+  const apiUrl = cfg.apiUrl.replace(/\/+$/, '')
 
   const controller = new AbortController()
   let timedOut = false
@@ -188,11 +192,11 @@ export async function agentCompletion(
 
   let resp: Response
   try {
-    resp = await fetch(`${API_BASE}/chat/completions`, {
+    resp = await fetch(`${apiUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify({
-        model: MODEL,
+        model: cfg.modelName,
         messages,
         tools,
         temperature: options.temperature ?? 0.3,
@@ -274,7 +278,7 @@ export function aiErrorMessage(e: unknown): string {
   if (msg === 'PARSE_ERROR') return 'AI 返回格式有误，请重试'
   if (msg.startsWith('API_ERROR:')) {
     const code = Number(msg.slice(10))
-    if (code === 402) return 'DeepSeek 账户余额不足，请到平台充值'
+    if (code === 402) return '所选模型厂商账户余额不足，请到对应平台充值'
     if (code === 429) return '请求过于频繁，请稍后再试'
     if (code === 401) return 'API Key 无效，请到设置页检查'
     return `服务暂时不可用（${code}），请稍后再试`
@@ -289,27 +293,110 @@ const SYSTEM_MSG = '你是一个记账助手，负责把交易截图或口语描
 
 /**
  * 批量识别支付/交易截图，返回结构化记账数据数组（与图片顺序一一对应）。
- * 模型不支持图片时抛 VisionUnsupportedError，调用方降级为手动填写。
+ * 模型支持视觉 → 直接传图片；纯文本模型 → 先本地 OCR 提取文字再交给模型。
+ * 两者都失败（如图片识别不出文字）抛 VisionUnsupportedError，调用方降级为手动填写。
  */
 export async function analyzeReceiptImage(imageDataUrls: string[]): Promise<ParsedLedgerItem[]> {
   if (imageDataUrls.length === 0) throw new Error('EMPTY_IMAGES')
+
+  const cfg = await getModelConfig()
+  const vision = !!cfg && isVisionModel(cfg.modelName)
+
+  // ---- 视觉模型：直接传图片 ----
+  if (vision) {
+    const content = await chatCompletion([
+      { role: 'system', content: SYSTEM_MSG },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `以下有 ${imageDataUrls.length} 张交易截图，请按顺序逐张识别消费信息，返回 JSON 数组（数组长度必须为 ${imageDataUrls.length}，顺序与图片一致）。每项格式：{"amount": 金额（元，数字，必须识别出具体数值）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "交易日期（YYYY-MM-DD）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}。无法识别的图对应元素返回 null。`,
+          },
+          ...imageDataUrls.map(url => ({ type: 'image_url', image_url: { url } })),
+        ],
+      },
+    ], { json: true, temperature: 0.1 })
+
+    const rawList = parseJsonArray(content)
+    return rawList.map(r => normalizeItem(r))
+  }
+
+  // ---- 纯文本模型：本地 OCR 提取文字，再交给模型解析 ----
+  const texts: string[] = []
+  for (const url of imageDataUrls) {
+    try { texts.push(await ocrImageDataUrl(url)) } catch { texts.push('') }
+  }
+  if (texts.every(t => !t.trim())) throw new VisionUnsupportedError()
 
   const content = await chatCompletion([
     { role: 'system', content: SYSTEM_MSG },
     {
       role: 'user',
-      content: [
-        {
-          type: 'text',
-          text: `以下有 ${imageDataUrls.length} 张交易截图，请按顺序逐张识别消费信息，返回 JSON 数组（数组长度必须为 ${imageDataUrls.length}，顺序与图片一致）。每项格式：{"amount": 金额（元，数字，必须识别出具体数值）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "交易日期（YYYY-MM-DD）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}。无法识别的图对应元素返回 null。`,
-        },
-        ...imageDataUrls.map(url => ({ type: 'image_url', image_url: { url } })),
-      ],
+      content:
+        `以下是 ${texts.length} 张交易截图 OCR 识别出的文字（按图片顺序），请逐张解析消费信息，返回 JSON 数组（数组长度必须为 ${texts.length}，顺序与图片一致）。` +
+        `每项格式：{"amount": 金额（元，数字，必须识别出具体数值）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "交易日期（YYYY-MM-DD）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}。无法识别的图对应元素返回 null。\n\n` +
+        texts.map((t, i) => `【第 ${i + 1} 张】\n${t || '（未能识别出文字）'}`).join('\n\n'),
     },
   ], { json: true, temperature: 0.1 })
 
   const rawList = parseJsonArray(content)
   return rawList.map(r => normalizeItem(r))
+}
+
+/** 测试连接结果 */
+export interface ConnectionTestResult {
+  ok: boolean
+  message: string
+}
+
+/**
+ * 测试一组模型配置是否可用（设置页「测试连接」）：
+ * 用当前填写的配置调用 /chat/completions 发送一条最小消息，能返回内容即视为成功。
+ */
+export async function testModelConnection(cfg: ModelConfig): Promise<ConnectionTestResult> {
+  const key = (cfg.apiKey ?? '').trim()
+  const url = (cfg.apiUrl ?? '').trim().replace(/\/+$/, '')
+  const model = (cfg.modelName ?? '').trim()
+  if (!key) return { ok: false, message: '请先填写 API Key' }
+  if (!url) return { ok: false, message: '请先填写 API Base URL' }
+  if (!model) return { ok: false, message: '请先填写模型 ID' }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  let resp: Response
+  try {
+    resp = await fetch(`${url}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'ping' }],
+        max_tokens: 8,
+        temperature: 0,
+        stream: false,
+      }),
+      signal: controller.signal,
+    })
+  } catch {
+    return { ok: false, message: '网络连接失败，请检查 API Base URL 与网络' }
+  } finally {
+    clearTimeout(timer)
+  }
+
+  if (resp.status === 401) return { ok: false, message: 'API Key 无效（401），请检查后重试' }
+  if (resp.status === 429) return { ok: false, message: '请求过于频繁（429），请稍后再试' }
+  if (!resp.ok) {
+    const detail = (await resp.text().catch(() => '')).slice(0, 200)
+    return { ok: false, message: `服务返回错误（HTTP ${resp.status}）${detail ? '：' + detail : ''}` }
+  }
+
+  const data = await resp.json().catch(() => null)
+  const content = data?.choices?.[0]?.message?.content
+  if (typeof content !== 'string' || !content.trim()) {
+    return { ok: false, message: '返回内容为空，请检查模型 ID 是否填写正确' }
+  }
+  return { ok: true, message: '连接成功' }
 }
 
 /** 把口语描述解析成一条结构化记账数据 */

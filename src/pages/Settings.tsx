@@ -1,7 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
 import { getSetting, setSetting, initDefaultCategories } from '../db/crud'
 import { db } from '../db/database'
-import { DEEPSEEK_API_KEY } from '../api/deepseek'
+import { testModelConnection } from '../api/deepseek'
+import {
+  PROVIDERS, getProvider, CUSTOM_PROVIDER_ID, DEFAULT_MODEL,
+  getModelConfig, saveModelConfig, clearModelConfig,
+} from '../api/modelConfig'
+import type { ModelProviderId, ModelConfig } from '../api/modelConfig'
 import { getAiMonthCount } from '../utils/aiUsage'
 import {
   buildSummaryJson, buildFullBackup, importFullBackup, downloadJson,
@@ -52,9 +57,15 @@ function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
 }
 
 export default function Settings() {
-  const [key, setKey] = useState('')
-  const [showKey, setShowKey] = useState(false)
-  const [configured, setConfigured] = useState(false)
+  // AI 模型配置
+  const [provider, setProvider] = useState<ModelProviderId>('deepseek')
+  const [modelName, setModelName] = useState(DEFAULT_MODEL)
+  const [apiUrl, setApiUrl] = useState('https://api.deepseek.com')
+  const [apiKey, setApiKey] = useState('')
+  const [showApiKey, setShowApiKey] = useState(false)
+  const [modelConfigured, setModelConfigured] = useState(false)
+  const [testBusy, setTestBusy] = useState(false)
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
   const [toast, setToast] = useState<string | null>(null)
   const [aiCount, setAiCount] = useState(0)
   // 防护设置
@@ -104,10 +115,19 @@ export default function Settings() {
   }
 
   async function load() {
-    const v = await getSetting(DEEPSEEK_API_KEY)
-    if (typeof v === 'string' && v.trim()) {
-      setKey(v)
-      setConfigured(true)
+    // AI 模型配置（兼容旧版 deepseekApiKey 自动迁移）
+    const cfg = await getModelConfig()
+    if (cfg) {
+      setProvider(cfg.provider)
+      setModelName(cfg.modelName)
+      setApiUrl(cfg.apiUrl)
+      setApiKey(cfg.apiKey)
+      setModelConfigured(true)
+    } else {
+      const p = PROVIDERS[0]
+      setProvider(p.id)
+      setModelName(p.models[0])
+      setApiUrl(p.apiUrl)
     }
     setAiCount(await getAiMonthCount())
     const [nl, fr, pl, frEnabled] = await Promise.all([
@@ -131,23 +151,82 @@ export default function Settings() {
     setSyncUrl(await getSyncServerUrl())
   }
 
-  async function handleSave() {
-    const k = key.trim()
+  // ==================== AI 模型配置 ====================
+
+  /** 选择厂商：自动加载该厂商第一个模型并填充 API Base URL（自定义模式保留手动输入） */
+  function handleProviderChange(id: ModelProviderId) {
+    setProvider(id)
+    setTestResult(null)
+    if (id === CUSTOM_PROVIDER_ID) return
+    const p = getProvider(id)
+    if (p && p.models.length > 0) {
+      setModelName(p.models[0])
+      setApiUrl(p.apiUrl)
+    }
+  }
+
+  /** 选择模型：自动填充 API Base URL（按厂商表） */
+  function handleModelChange(m: string) {
+    setModelName(m)
+    setTestResult(null)
+    const p = getProvider(provider)
+    if (p && p.id !== CUSTOM_PROVIDER_ID) setApiUrl(p.apiUrl)
+  }
+
+  async function handleSaveModel() {
+    const p = provider
+    const m = modelName.trim()
+    const u = apiUrl.trim()
+    const k = apiKey.trim()
+    if (p === CUSTOM_PROVIDER_ID) {
+      if (!u) {
+        setToast('请填写 API Base URL')
+        setTimeout(() => setToast(null), 2000)
+        return
+      }
+      if (!m) {
+        setToast('请填写模型 ID')
+        setTimeout(() => setToast(null), 2000)
+        return
+      }
+    }
     if (!k) {
-      setToast('请输入 API Key')
+      setToast('请填写 API Key')
       setTimeout(() => setToast(null), 2000)
       return
     }
-    await setSetting(DEEPSEEK_API_KEY, k)
-    setConfigured(true)
-    setToast('✅ API Key 已保存')
+    const cfg: ModelConfig = { provider: p, modelName: m, apiUrl: u, apiKey: k }
+    await saveModelConfig(cfg)
+    setModelConfigured(true)
+    setToast('✅ 配置已保存，立即生效')
     setTimeout(() => setToast(null), 2500)
   }
 
-  function handleClear() {
-    setKey('')
-    setConfigured(false)
-    setToast('已清除 API Key')
+  /** 测试连接：用当前表单里的配置（未保存也测）调用 /chat/completions */
+  async function handleTestModel() {
+    if (testBusy) return
+    if (!apiKey.trim()) {
+      setToast('请先填写 API Key')
+      setTimeout(() => setToast(null), 2000)
+      return
+    }
+    setTestBusy(true)
+    setTestResult(null)
+    const r = await testModelConnection({
+      provider, modelName: modelName.trim(), apiUrl: apiUrl.trim(), apiKey: apiKey.trim(),
+    })
+    setTestResult(r)
+    setTestBusy(false)
+    setToast(r.ok ? '✅ 连接成功' : '❌ 连接失败')
+    setTimeout(() => setToast(null), 2500)
+  }
+
+  async function handleClearModel() {
+    await clearModelConfig()
+    setApiKey('')
+    setModelConfigured(false)
+    setTestResult(null)
+    setToast('已清除 AI 模型配置')
     setTimeout(() => setToast(null), 2000)
   }
 
@@ -427,6 +506,12 @@ export default function Settings() {
     boxSizing: 'border-box', background: '#E8EAEA',
   }
 
+  const selectStyle: React.CSSProperties = {
+    width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #C0C4C4',
+    fontSize: 14, color: 'var(--color-text)', outline: 'none', fontFamily: 'var(--font-stack)',
+    boxSizing: 'border-box', background: '#E8EAEA',
+  }
+
   return (
     <div style={{ maxWidth: 1100, width: '100%' }}>
       {toast && (
@@ -440,7 +525,7 @@ export default function Settings() {
       )}
 
       <h1 style={{ fontSize: 24, fontWeight: 700, color: 'var(--color-text)', marginBottom: 4 }}>设置</h1>
-      <p style={{ fontSize: 14, color: 'var(--color-text-secondary)', marginBottom: 24 }}>配置 AI 能力（截图识别 / 语音记账）</p>
+      <p style={{ fontSize: 14, color: 'var(--color-text-secondary)', marginBottom: 24 }}>配置 AI 能力（模型厂商 / 对话 / 报告 / 截图识别 / 语音记账）</p>
 
       {/* 两栏布局：左 2/3 主要设置 · 右 1/3 说明/用量/关于 */}
       <div style={{
@@ -451,47 +536,115 @@ export default function Settings() {
       }}>
         {/* ========== 左栏：主要设置 ========== */}
         <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 24 }}>
-          {/* API Key */}
+          {/* AI 模型配置 */}
           <div className="card" style={{ padding: 24 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-text)' }}>DeepSeek API Key</span>
+              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-text)' }}>🤖 AI 模型配置</span>
               <span style={{
                 fontSize: 12, padding: '3px 10px', borderRadius: 20, fontWeight: 600,
-                background: configured ? 'rgba(34,211,238,0.08)' : '#E4E6E6',
-                color: configured ? '#22D3EE' : '#888888',
+                background: modelConfigured ? 'rgba(34,211,238,0.08)' : '#E4E6E6',
+                color: modelConfigured ? '#22D3EE' : '#888888',
               }}>
-                {configured ? `已配置 · 尾号 ${maskKey(key)}` : '未配置'}
+                {modelConfigured
+                  ? `已配置 · ${modelName}${apiKey ? ` · 尾号 ${maskKey(apiKey)}` : ''}`
+                  : '未配置'}
               </span>
             </div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 16 }}>
-              Key 只存在你自己的浏览器本地，不会上传到任何服务器
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 16, lineHeight: 1.7 }}>
+              AI 对话、AI 报告、截图识别、批量导入账单都会使用这里选择的模型（OpenAI 兼容格式）。
+              Key 保存在浏览器本地，也会随数据同步上传到你自己的服务器，供后端代理调用。
             </div>
 
-            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-              <div style={{ position: 'relative', flex: 1 }}>
-                <input
-                  type={showKey ? 'text' : 'password'}
-                  value={key}
-                  onChange={(e) => setKey(e.target.value)}
-                  placeholder="sk-..."
-                  style={inputStyle}
-                />
-                <button
-                  onClick={() => setShowKey(v => !v)}
-                  title={showKey ? '隐藏' : '显示'}
-                  style={{
-                    position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
-                    background: 'none', border: 'none', color: '#888888', fontSize: 14, cursor: 'pointer',
-                  }}>
-                  {showKey ? '🙈' : '👁'}
-                </button>
-              </div>
+            {/* 厂商（一级下拉） */}
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>模型厂商</div>
+            <select
+              value={provider}
+              onChange={(e) => handleProviderChange(e.target.value as ModelProviderId)}
+              style={{ ...selectStyle, marginBottom: 14 }}
+            >
+              {PROVIDERS.map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.label}{p.note ? `（${p.note}）` : ''}
+                </option>
+              ))}
+            </select>
+
+            {/* 模型（二级下拉，联动加载；自定义模式为手动输入） */}
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>
+              {provider === CUSTOM_PROVIDER_ID ? '模型 ID' : '具体模型'}
             </div>
+            {provider === CUSTOM_PROVIDER_ID ? (
+              <input
+                value={modelName}
+                onChange={(e) => { setModelName(e.target.value); setTestResult(null) }}
+                placeholder="如 my-custom-model"
+                style={{ ...inputStyle, marginBottom: 14 }}
+              />
+            ) : (
+              <select
+                value={modelName}
+                onChange={(e) => handleModelChange(e.target.value)}
+                style={{ ...selectStyle, marginBottom: 14 }}
+              >
+                {(getProvider(provider)?.models ?? []).map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            )}
+
+            {/* API Base URL（预设自动填充，可手动改；自定义必须手填） */}
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>API Base URL</div>
+            <input
+              value={apiUrl}
+              onChange={(e) => { setApiUrl(e.target.value); setTestResult(null) }}
+              placeholder="https://api.example.com/v1"
+              style={{ ...inputStyle, marginBottom: 14 }}
+            />
+
+            {/* API Key */}
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>API Key</div>
+            <div style={{ position: 'relative', marginBottom: 14 }}>
+              <input
+                type={showApiKey ? 'text' : 'password'}
+                value={apiKey}
+                onChange={(e) => { setApiKey(e.target.value); setTestResult(null) }}
+                placeholder="sk-..."
+                style={inputStyle}
+              />
+              <button
+                onClick={() => setShowApiKey(v => !v)}
+                title={showApiKey ? '隐藏' : '显示'}
+                style={{
+                  position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
+                  background: 'none', border: 'none', color: '#888888', fontSize: 14, cursor: 'pointer',
+                }}>
+                {showApiKey ? '🙈' : '👁'}
+              </button>
+            </div>
+
+            {/* 测试连接结果 */}
+            {testResult && (
+              <div style={{
+                padding: '9px 12px', borderRadius: 10, marginBottom: 14, fontSize: 12.5, lineHeight: 1.6,
+                background: testResult.ok ? 'rgba(34,197,94,0.08)' : '#FEF2F2',
+                color: testResult.ok ? '#16A34A' : '#D73333', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+              }}>
+                {testResult.ok ? '✅ 连接成功' : '❌ ' + testResult.message}
+              </div>
+            )}
 
             <div style={{ display: 'flex', gap: 10 }}>
-              <button onClick={handleSave} className="btn-primary" style={{ padding: '9px 24px' }}>保存</button>
-              {configured && (
-                <button onClick={handleClear}
+              <button
+                onClick={() => void handleTestModel()}
+                disabled={testBusy}
+                style={{
+                  padding: '9px 18px', borderRadius: 10, border: '1px solid #C0C4C4', background: '#D8DADA',
+                  fontSize: 14, cursor: testBusy ? 'not-allowed' : 'pointer', fontFamily: 'var(--font-stack)',
+                  opacity: testBusy ? 0.6 : 1,
+                }}>
+                {testBusy ? '测试中…' : '🔄 测试连接'}
+              </button>
+              <button onClick={() => void handleSaveModel()} className="btn-primary" style={{ padding: '9px 24px' }}>保存</button>
+              {modelConfigured && (
+                <button onClick={() => void handleClearModel()}
                   style={{
                     padding: '9px 18px', borderRadius: 10, fontSize: 14, cursor: 'pointer',
                     background: '#D8DADA', border: '1px solid #C0C4C4', color: '#888888', fontFamily: 'var(--font-stack)',
@@ -770,7 +923,7 @@ export default function Settings() {
               </span>
             </div>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 10, lineHeight: 1.8 }}>
-              包含：报告生成、AI 财务助手问答、截图/语音记账解析、冲动消费解读。每次调用都会消耗 DeepSeek 账户额度。
+              包含：报告生成、AI 财务助手问答、截图/语音记账解析、冲动消费解读。每次调用都会消耗所选模型厂商的账户额度。
             </div>
           </div>
 
