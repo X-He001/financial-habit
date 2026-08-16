@@ -6,7 +6,7 @@
 //  3. saveBatchItems       批量写入 IndexedDB（复用 guardTransaction 计算冲动分）
 // =====================================================================
 import type { Transaction } from '../types'
-import { addTransaction } from '../db/crud'
+import { addTransaction, getAllTransactions } from '../db/crud'
 import { guardTransaction } from './impulseEngine'
 import { chatCompletion, analyzeReceiptImagesMulti, normalizeItem, extractJsonList } from '../api/deepseek'
 import type { ParsedLedgerItem } from '../api/deepseek'
@@ -27,6 +27,8 @@ export interface BatchItem {
   paymentMethod: string
   note: string
   checked: boolean
+  /** CSV 交易单号（F3 重复检测：跨库去重依据，非 CSV 导入为 null） */
+  importId?: string | null
 }
 
 /** 进度回调：label 为阶段文字，percent 为 0-100（null 表示不确定进度） */
@@ -226,7 +228,7 @@ async function structureViaProxy(text: string, source: string): Promise<Record<s
 
 function mapProxyError(code: string | number): string {
   if (code === 'INVALID_KEY' || code === 401) return 'API Key 无效，请到设置页检查'
-  if (code === 'BALANCE' || code === 402) return 'DeepSeek 账户余额不足，请到平台充值'
+  if (code === 'BALANCE' || code === 402) return 'AI 模型账户余额不足，请到对应平台充值'
   if (code === 'AI_NETWORK_ERROR') return '网络异常，请检查网络后重试'
   if (code === 'EMPTY_RESPONSE') return 'AI 返回为空，请重试'
   if (code === 'PARSE_ERROR') return 'AI 返回格式有误，请重试'
@@ -298,18 +300,32 @@ function resolveTime(timeStr: string): string {
 export interface BatchSaveResult {
   saved: number
   failed: number
+  /** 跨库按交易单号去重跳过的条数（F3 重复检测） */
+  skipped: number
 }
 
 /**
  * 批量写入 IndexedDB：逐条计算冲动分后 addTransaction（source=import）。
  * 用户在预览区已确认过，因此不走冷静流程拦截。
+ * F3 重复检测：带交易单号（importId）的条目若库中已存在同单号 → 跳过，不重复入库。
  */
 export async function saveBatchItems(items: BatchItem[]): Promise<BatchSaveResult> {
   let saved = 0
   let failed = 0
+  let skipped = 0
+  // 已有 importId 集合（去重依据）
+  const existing = new Set<string>()
+  for (const tx of await getAllTransactions()) {
+    if (tx.importId) existing.add(tx.importId)
+  }
+  const seen = new Set<string>()
   for (const it of items) {
     const amountMinor = Math.round(it.amount * 100)
     if (amountMinor <= 0) { failed++; continue }
+    if (it.importId) {
+      if (existing.has(it.importId) || seen.has(it.importId)) { skipped++; continue }
+      seen.add(it.importId)
+    }
     const tx: Omit<Transaction, 'id'> = {
       txType: it.txType,
       amountMinor,
@@ -324,7 +340,7 @@ export async function saveBatchItems(items: BatchItem[]): Promise<BatchSaveResul
       revokedAt: null,
       regretValue: null,
       regretAt: null,
-      importId: null,
+      importId: it.importId ?? null,
       note: it.note.trim() || '',
       screenshot: null,
     }
@@ -344,5 +360,5 @@ export async function saveBatchItems(items: BatchItem[]): Promise<BatchSaveResul
       failed++
     }
   }
-  return { saved, failed }
+  return { saved, failed, skipped }
 }

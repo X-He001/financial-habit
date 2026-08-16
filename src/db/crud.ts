@@ -1,13 +1,14 @@
 import type { IndexableType } from 'dexie'
 import { db } from './database'
 import { requestPushToCloud } from '../sync/realtimeSync'
-import { LAST_SYNC_AT_KEY } from '../sync/pushSync'
+import { LAST_SYNC_AT_KEY } from '../sync/keys'
 import type {
   Transaction, Account, SavingsGoal, SinkingFund,
   WishlistItem, Debt, SavingsRule, NotificationLog, Category, Schedule, Setting, WishlistChat,
   BalanceSnapshot, Commitment, Mood,
   ConsumerEvent, DecisionRecord, BehaviorProfile, Insight,
   CreditAccount, CreditStatement, Installment,
+  KnowledgeRef, FeedbackLog, AgentInboxItem,
 } from '../types'
 
 // ==================== 通用 CRUD 工具 ====================
@@ -353,7 +354,9 @@ const DEFAULT_CATEGORIES: Omit<Category, 'id'>[] = [
 ]
 
 export async function initDefaultCategories(): Promise<void> {
-  await db.categories.clear()
+  // 防重复：已有分类（如已从云端合并而来）时跳过，避免重新生成随机 id 造成跨端重复分类。
+  // 调用方（首次清空/清空业务数据）都会先清空 categories，此处为空时才会重建。
+  if ((await db.categories.count()) > 0) return
   for (const cat of DEFAULT_CATEGORIES) {
     await db.categories.add({ id: uuid(), ...cat } as Category)
   }
@@ -576,6 +579,80 @@ export async function getInsightBySourceKey(sourceKey: string): Promise<Insight 
   return db.insights.where('sourceKey').equals(sourceKey).first()
 }
 
+// ==================== KnowledgeRef 知识库（F5 7.2） ====================
+
+export async function addKnowledgeRef(data: Omit<KnowledgeRef, 'id'>): Promise<string> {
+  const id = uuid()
+  await db.knowledgeRefs.add({ id, ...data } as KnowledgeRef)
+  requestPushToCloud()
+  return id
+}
+
+export async function putKnowledgeRef(data: KnowledgeRef): Promise<void> {
+  await db.knowledgeRefs.put(data)
+  requestPushToCloud()
+}
+
+export async function getAllKnowledgeRefs(): Promise<KnowledgeRef[]> {
+  return db.knowledgeRefs.toArray()
+}
+
+export async function getActiveKnowledgeRefs(): Promise<KnowledgeRef[]> {
+  return db.knowledgeRefs.filter(r => r.status === 'active').toArray()
+}
+
+// ==================== FeedbackLog 反馈效果日志（F5 7.3⑩） ====================
+
+export async function addFeedbackLog(data: Omit<FeedbackLog, 'id'>): Promise<string> {
+  const id = uuid()
+  await db.feedbackLogs.add({ id, ...data } as FeedbackLog)
+  requestPushToCloud()
+  return id
+}
+
+export async function updateFeedbackLog(id: string, data: Partial<FeedbackLog>): Promise<void> {
+  await db.feedbackLogs.update(id, data)
+  requestPushToCloud()
+}
+
+export async function getFeedbackLog(id: string): Promise<FeedbackLog | undefined> {
+  return db.feedbackLogs.get(id)
+}
+
+export async function getAllFeedbackLogs(): Promise<FeedbackLog[]> {
+  return db.feedbackLogs.toArray()
+}
+
+// ==================== AgentInbox 反馈/提醒队列（F5 7.3⑨ + 7.6） ====================
+
+export async function addAgentInboxItem(data: Omit<AgentInboxItem, 'id'>): Promise<string> {
+  const id = uuid()
+  await db.agentInbox.add({ id, ...data } as AgentInboxItem)
+  requestPushToCloud()
+  return id
+}
+
+export async function updateAgentInboxItem(id: string, data: Partial<AgentInboxItem>): Promise<void> {
+  await db.agentInbox.update(id, data)
+  requestPushToCloud()
+}
+
+export async function getAgentInboxItem(id: string): Promise<AgentInboxItem | undefined> {
+  return db.agentInbox.get(id)
+}
+
+export async function getAllAgentInboxItems(): Promise<AgentInboxItem[]> {
+  return db.agentInbox.toArray()
+}
+
+/** 已到期且未处理/未关闭的队列条目（首页看板展示用，按 scheduledAt 升序） */
+export async function getDueAgentInboxItems(): Promise<AgentInboxItem[]> {
+  const now = new Date().toISOString()
+  return db.agentInbox
+    .filter(i => i.status === 'pending' && i.scheduledAt <= now)
+    .sortBy('scheduledAt')
+}
+
 // ==================== 清空数据 ====================
 
 export async function clearAllData(): Promise<void> {
@@ -601,6 +678,9 @@ export async function clearAllData(): Promise<void> {
   await db.creditAccounts.clear()
   await db.creditStatements.clear()
   await db.installments.clear()
+  await db.knowledgeRefs.clear()
+  await db.feedbackLogs.clear()
+  await db.agentInbox.clear()
 
   console.log('🗑️ 所有数据已清空（表结构保留）')
 }

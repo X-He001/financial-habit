@@ -62,7 +62,10 @@ export default function BatchPreviewList({ items, onChange, onSaved, title, rese
     setOkMsg(null)
     try {
       const res = await saveBatchItems(items.filter((it) => it.checked))
-      setOkMsg(`✅ 成功保存 ${res.saved} 条${res.failed > 0 ? `，${res.failed} 条失败` : ''}`)
+      const parts = [`成功保存 ${res.saved} 条`]
+      if (res.skipped > 0) parts.push(`跳过重复 ${res.skipped} 条`)
+      if (res.failed > 0) parts.push(`${res.failed} 条失败`)
+      setOkMsg(`✅ ${parts.join('，')}`)
       window.dispatchEvent(new CustomEvent('dashboard-refresh'))
       onSaved()
     } catch (e) {

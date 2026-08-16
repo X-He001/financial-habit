@@ -6,7 +6,6 @@ import {
 import type { Transaction, Category, CreditAccount } from '../types'
 import OcrTab from '../components/ledger/OcrTab'
 import VoiceTab from '../components/ledger/VoiceTab'
-import ImportTab from '../components/ledger/ImportTab'
 import BatchImportTab from '../components/ledger/BatchImportTab'
 import { runSaveFlow } from '../utils/saveFlow'
 import { SHOP_CATEGORIES, isImpulsive } from '../utils/impulseEngine'
@@ -24,7 +23,6 @@ const LEDGER_TABS = [
   { key: 'manual', label: '✏️ 手动' },
   { key: 'ocr', label: '📷 截图识别' },
   { key: 'voice', label: '🎤 语音记账' },
-  { key: 'import', label: '📥 导入' },
   { key: 'batch', label: '📦 批量导入' },
 ] as const
 type LedgerTab = typeof LEDGER_TABS[number]['key']
@@ -126,7 +124,8 @@ export default function Ledger() {
   const filteredAccounts = creditAccounts.filter((a) => a.platform === paymentMethod)
   const displayCats: { id: string; name: string; icon: string; color: string; isDefault: boolean }[] = isIncome
     ? INCOME_CATEGORIES.map((c) => ({ id: c.name, name: c.name, icon: c.icon, color: '#22D3EE', isDefault: true }))
-    : categories
+    // F3 标签去重：分类下拉按名称去重（历史/跨端同步可能产生同名分类，只显示一个）
+    : categories.filter((c, i, arr) => arr.findIndex(x => x.name === c.name) === i)
 
   // 加载
   async function loadData() {
@@ -268,13 +267,17 @@ export default function Ledger() {
         }
         tx.lienAccountId = account.id
         const r = await recordCreditPurchase(tx, account)
-        setToast(`✅ 已用${paymentMethod}记 ¥${formatYuan(amountMinor)} · 借来的钱，未来约 ${r.graceDays} 天要还 ¥${formatYuan(amountMinor)}`)
+        // 债务联动提示（代码估算，只展示不拦截）：这笔信贷消费会让该账户清零日推迟约 Y 天
+        const delayText = r.clearDelayDays !== null && r.clearDelayDays > 0
+          ? ` · 这笔 ¥${formatYuan(amountMinor)} 会让该账户清零日推迟约 ${r.clearDelayDays} 天`
+          : ''
+        setToast(`✅ 已用${paymentMethod}记 ¥${formatYuan(amountMinor)} · 借来的钱，未来约 ${r.graceDays} 天要还 ¥${formatYuan(amountMinor)}${delayText}`)
       } else {
         const txId = await addTransaction(tx)
         // 冲动消费已入库 → 触发"今日冲动复盘"入口
         window.dispatchEvent(new CustomEvent('impulse-saved', { detail: { tx: { ...tx, id: txId } } }))
         const reasonText = result.reasons.length > 0 ? ` · ${result.reasons.join('、')}` : ''
-        setToast(`✅ 已记录支出 ¥${formatYuan(amountMinor)} · ${categoryName} · 冲动 ${result.score} 分（${IMPULSE_LABEL[result.level]}）${reasonText}`)
+        setToast(`✅ 已记录支出 ¥${formatYuan(amountMinor)} · ${categoryName} · 冲动 ${IMPULSE_LABEL[result.level]}${reasonText}`)
       }
     }
     window.dispatchEvent(new CustomEvent('dashboard-refresh'))
@@ -414,9 +417,6 @@ export default function Ledger() {
               </div>
             </div>
           )}
-
-          {/* Import Tab */}
-          {tab === 'import' && <ImportTab />}
 
           {/* Batch Import Tab */}
           {tab === 'batch' && <BatchImportTab onSaved={loadData} />}

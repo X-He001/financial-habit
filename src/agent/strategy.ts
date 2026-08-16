@@ -34,7 +34,9 @@ export function classify(metrics: ReviewMetrics): ReviewClassification {
   // —— impulse · 高冲动 + 老毛病 ——
   const im: string[] = []
   if (metrics.impulseStrength >= 70) {
-    im.push(`冲动强度 ${metrics.impulseStrength} 分（高危）`)
+    im.push('冲动强度·很高（高危）')
+  } else if (metrics.impulseStrength >= 51) {
+    im.push('冲动强度·高')
   }
   if (metrics.repeatRate >= 3) {
     im.push(`近30天同类场景已出现 ${metrics.repeatRate} 次`)

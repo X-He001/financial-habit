@@ -204,6 +204,8 @@ export interface Installment {
   feePerMinor: number // 每期手续费
   realApr: number // 真实年化（Newton 法反解），百分比
   createdAt: string
+  /** 计划来源：'user' = 用户手动填写月还/月数；缺省 = 旧版按金额自动推算的期数（兼容保留，不删改） */
+  source?: 'user' | 'auto'
 }
 
 // ========== 自动化储蓄规则 ==========
@@ -312,6 +314,19 @@ export interface DecisionRecord {
 
 // ========== 行为画像（统计引擎实时计算，非手写模板） ==========
 
+/** 认知教练（Cognitive Coach）逐次复盘存档：用户自述 / 洞察结论 / 自我标记 */
+export interface CoachNote {
+  id: string
+  ts: string // ISO 时间
+  type: 'onboarding' | 'review' | 'self_label' | 'reflection'
+  /** 主题标签：消费习惯 / 场景触发 / 存钱目标 / 风险点 / 自我认知 / 模式命名 */
+  tag: string | null
+  /** 用户关键回答 / AI 洞察结论（供下次复盘引用，如"上次你说深夜压力大会点外卖"） */
+  content: string
+  /** 引用的真实数据（如"深夜订单 3 笔 ¥128"），由工具调用方写入 */
+  dataRef?: string | null
+}
+
 export interface BehaviorProfile {
   id: string
   nightRisk: number // 近30天深夜消费占比 0-100
@@ -322,6 +337,8 @@ export interface BehaviorProfile {
   highRiskWindows: string[] // 近30天冲动最集中时段 Top2，如 ['22:00-24:00']
   highRiskCategories: string[] // 近30天冲动最集中分类 Top2
   avgPurchaseQuality: number | null // 近90天购买质量分均值（30天反馈后才有）
+  // ---- 认知教练存档（统计重算时保留，不参与画像统计） ----
+  coachNotes?: CoachNote[]
   lastUpdatedAt: string
 }
 
@@ -337,3 +354,108 @@ export interface Insight {
   acknowledged: boolean
   sourceKey: string | null // 去重键，如 3nights_2026-08-10 / savings_2026-08
 }
+
+// ========== F5 购买反馈 Agent 循环：知识库 / 反馈日志 / 队列 ==========
+
+/**
+ * 知识库条目（knowledge_refs）
+ * F5 7.2：检索式"图书馆"，不是触发式"触发器"。
+ * - 没有 trigger_keywords 字段（禁止机械匹配）；Agent 用推理语境检索概念。
+ * - 书/作者信息只作为出处（citation）用于"了解更多"折叠区，禁止出现在反馈正文。
+ */
+export interface KnowledgeRef {
+  id: string
+  /** 概念类别：犹豫合理化 / 情绪渴望 / 习惯身份 / 稀缺限时 / 资产负债 / 储蓄金鹅 */
+  category: string
+  /** 概念名（如"犹豫合理化"） */
+  concept: string
+  /** 书名（仅存元数据，不直接进正文） */
+  book: string
+  /** 作者（仅存元数据，不直接进正文） */
+  author: string
+  /** 核心论点（供 Agent 理解与情境匹配，可改写） */
+  thesis: string
+  /** 适用场景描述（供情境检索打分） */
+  applicable_scenarios: string[]
+  /** 可落地的动作模板（Agent 基于具体场景改写） */
+  action_templates: string[]
+  /** 术语的人话科普文案（Agent 可基于场景改写，必须大白话） */
+  plain_explanation: string
+  /** 出处，仅"了解更多"折叠区展示，绝不进正文 */
+  citation: string
+  /** active=可用 / pending=待审 */
+  status: 'active' | 'pending'
+  updatedAt: string
+}
+
+/**
+ * 反馈效果日志（feedback_logs）
+ * F5 7.3⑩：反馈 2 周后自动回查该模式消费变化，≥20% 下降 → effective，否则 ineffective。
+ * 下次同类场景优先用 effective 角度、跳过 ineffective 角度。
+ */
+export interface FeedbackLog {
+  id: string
+  /** 关联 agent_inbox 条目 id（同一反馈的显示队列记录） */
+  inboxId: string
+  /** 正面（进步） / 负面（问题）反馈 */
+  type: 'positive' | 'negative'
+  /** 反馈对象：wishlist=欲望清单犹豫后购买（对象A）/ event=对话中承认陷阱的消费（对象B） */
+  objectType: 'wishlist' | 'event'
+  objectId: string
+  /** 关联知识库条目（⑤检索命中的概念） */
+  knowledgeRefId?: string | null
+  /** ④ 形成的假设（供回查与下次引用） */
+  hypothesis: string
+  /** ⑥ 生成的开场（一个数据观察 + 一个开放问题） */
+  opening: string
+  /** 模式标识（如"深夜购物"），用于⑩前后对比 */
+  patternKey: string
+  /** ⑩ 反馈前该模式消费金额（分） */
+  beforeMinor: number
+  /** ⑩ 反馈后该模式消费金额（分） */
+  afterMinor?: number | null
+  /** ⑩ 效果：下降≥20% → effective，否则 ineffective */
+  effectStatus?: 'effective' | 'ineffective' | null
+  effectCheckedAt?: string | null
+  /** 实际对话轮数（7.5.2：单卡最多 4 轮） */
+  rounds: number
+  createdAt: string
+  updatedAt: string
+}
+
+/**
+ * 反馈/提醒队列（agent_inbox）
+ * F5 7.3⑨ + 7.6：Agent 判断有必要 → 写入队列，scheduled_at = 次日 09:00；
+ * 次日 09:00 后用户打开应用时，首页看板顶部展示。
+ */
+export interface AgentInboxItem {
+  id: string
+  /** feedback_card=反馈卡 / impulse_window=高频冲动窗口提醒（7.7） */
+  kind: 'feedback_card' | 'impulse_window'
+  objectType: 'wishlist' | 'event' | 'window'
+  objectId: string
+  /** 卡片标题 */
+  title: string
+  /** 开场内容（数据观察 + 开放问题；窗口提醒为分析文案） */
+  opening: string
+  /** 关联知识库条目 */
+  knowledgeRefId?: string | null
+  /** 关联反馈日志（feedback_card 时） */
+  feedbackLogId?: string | null
+  /** 展示时间（次日 09:00） */
+  scheduledAt: string
+  /** pending=排队中 / shown=已展示 / dismissed=用户关闭 / completed=对话完成 */
+  status: 'pending' | 'shown' | 'dismissed' | 'completed'
+  /** 对话轮数（7.5.2：最多 4 轮） */
+  rounds: number
+  createdAt: string
+  updatedAt: string
+}
+
+/**
+ * 隐私分层三档（AI 调用层脱敏，F5 配套规则，确认版）
+ * 档1 聚合数据（默认，日常分析）：只传聚合统计，绝不传单笔明细（商户名/备注/单笔金额明细列表）
+ * 档2 脱敏单笔（反馈/引用场景）：金额/时间/类别保留，商户名/平台名/备注 → "某平台"/"某商户"
+ * 档3 完整单笔（仅用户主动查明细时）：用户明确发起单笔查询才使用，循环/日常分析不得自动使用
+ */
+export type PrivacyTier = 1 | 2 | 3

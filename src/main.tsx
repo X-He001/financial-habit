@@ -5,12 +5,16 @@ import './index.css'
 import App from './App'
 import { db } from './db/database'
 import { initDefaultCategories, addSchedule, getAllSchedules } from './db/crud'
+import { installUpdatedAtHooks } from './db/syncHooks'
 
 // PWA Service Worker 注册（自动更新）
 registerSW({ immediate: true })
 
 // 数据库就绪确认
 console.log('✅ 数据库已就绪 financial-habit-db')
+
+// 注册同步钩子：本地写入自动打 updatedAt + 触发自动推送（须在首次写库前安装）
+installUpdatedAtHooks(db)
 
 /** 业务表（保留 settings 表：DeepSeek Key / 预算 / 防护设置等配置） */
 const BUSINESS_TABLES = [

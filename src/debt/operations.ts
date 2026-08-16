@@ -6,7 +6,7 @@ import {
   addCreditAccount, addInstallment, getAllCreditAccounts, getAllCreditStatements,
 } from '../db/crud'
 import type { Transaction, CreditAccount, CreditPlatform } from '../types'
-import { realAprNewton, monthKeyOf, dateKeyOf } from './calc'
+import { realAprNewton, accountApr, simulateClearDays, monthKeyOf, dateKeyOf } from './calc'
 import { recordConsumerEvent } from '../agent/profile'
 
 /** 账户的平台中文名（负债支付与旧支付方式映射用） */
@@ -62,18 +62,43 @@ export function currentPeriodDates(acc: CreditAccount): { period: string; statem
 }
 
 /**
+ * 估算"这笔消费会让该账户清零日推迟多少天"：
+ * 月还款额取 用户手填还款计划(principalPerMinor) → 本期应还 → 最低还款；全无则返回 null。
+ * 用 simulateClearDays 对比"当前本金"与"当前本金+这笔消费"的清零天数差（全由代码算）。
+ */
+async function computeClearDelayDays(
+  account: CreditAccount,
+  extraMinor: number,
+  principalBeforeMinor: number
+): Promise<number | null> {
+  if (extraMinor <= 0) return null
+  const insts = await db.installments.where('accountId').equals(account.id).toArray()
+  const userInst = insts.filter(i => i.source === 'user').sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0]
+  const cur = await getCurrentStatement(account.id)
+  const monthly = userInst?.principalPerMinor ?? cur?.statementAmtMinor ?? cur?.minPaymentMinor ?? 0
+  if (monthly <= 0) return null
+  const apr = accountApr(account.rateType, account.feeRate)
+  const dailyRate = account.rateType === 'day_fee' ? account.feeRate : Math.pow(1 + apr / 100, 1 / 365) - 1
+  const before = simulateClearDays(principalBeforeMinor, monthly, dailyRate)
+  const after = simulateClearDays(principalBeforeMinor + extraMinor, monthly, dailyRate)
+  if (before === null || after === null) return null
+  return Math.max(0, Math.round(after - before))
+}
+
+/**
  * ① 负债支付入账：写一笔支出（fundingSource/lienAccountId）+ 该账户当前期账单累计待还。
- * 返回提示文案所需信息。
+ * 返回提示文案所需信息（含"清零日推迟天数"，由代码估算）。
  */
 export async function recordCreditPurchase(
   tx: Omit<Transaction, 'id'>,
   account: CreditAccount
-): Promise<{ graceDays: number; amountMinor: number }> {
+): Promise<{ graceDays: number; amountMinor: number; clearDelayDays: number | null }> {
   // 1. 支出
   await addTransaction(tx)
 
   // 2. 当前期账单累计
   const cur = await getCurrentStatement(account.id)
+  const principalBefore = cur?.principalRemMinor ?? 0
   const { period, statementDate, dueDate } = currentPeriodDates(account)
   if (cur && cur.period === period) {
     await updateCreditStatement(cur.id, {
@@ -97,7 +122,8 @@ export async function recordCreditPurchase(
     })
   }
   window.dispatchEvent(new CustomEvent('dashboard-refresh'))
-  return { graceDays: account.graceDays, amountMinor: tx.amountMinor }
+  const clearDelayDays = await computeClearDelayDays(account, tx.amountMinor, principalBefore)
+  return { graceDays: account.graceDays, amountMinor: tx.amountMinor, clearDelayDays }
 }
 
 /**
@@ -222,7 +248,8 @@ const PLATFORM_PAY_METHOD: Record<string, Transaction['paymentMethod']> = {
  * - 同平台已有账户 → 当前期账单累加待还（无当前期则新建）
  * - 同平台无账户 → 自动创建账户（平台默认费率，XIRR>0 时覆盖为年化利率）+ 新建当前期账单
  * - 写一笔负债支出交易 + 一条消费事件（consumer_events，供画像统计）
- * - 月还款 > 0 时存一条分期记录（供未来还款预估）
+ * - 还款计划（用户手动填写月还 + 月数时）→ 存一条分期计划记录，仅作还款估算用；
+ *   按单月逐条记录，不预生成多月记录；两者缺一不自动推算
  */
 export async function recordNewDebt(data: {
   platform: CreditPlatform
@@ -230,7 +257,8 @@ export async function recordNewDebt(data: {
   use: string // 用途/商家
   feeRate: number // XIRR 年化（%），默认 0 → 用平台默认费率
   nextDueDate: string // 下次还款日 yyyy-mm-dd
-  monthlyPayMinor: number // 月还款（分），默认 0
+  monthlyPayMinor: number // 每月还款额（分），用户手动填写
+  totalMonths: number // 需还款月数，用户手动填写
 }): Promise<{ account: CreditAccount; txId: string }> {
   // 1. 定位账户：同平台已存在则复用，否则自动创建
   const all = await getAllCreditAccounts()
@@ -308,17 +336,18 @@ export async function recordNewDebt(data: {
   // 4. 消费事件（画像统计）
   await recordConsumerEvent({ ...tx, id: txId })
 
-  // 5. 月还款（可选）→ 分期记录
-  if (data.monthlyPayMinor > 0) {
+  // 5. 还款计划（用户手动填写月还 + 月数才存；只存一条，不做多期预生成，不自动推算）
+  if (data.monthlyPayMinor > 0 && data.totalMonths > 0) {
     await addInstallment({
       accountId: account.id,
       txId,
-      totalPeriods: Math.max(1, Math.ceil(data.amountMinor / data.monthlyPayMinor)),
+      totalPeriods: data.totalMonths,
       currentPeriod: 1,
       principalPerMinor: data.monthlyPayMinor,
       feePerMinor: 0,
       realApr: data.feeRate,
       createdAt: now.toISOString(),
+      source: 'user',
     })
   }
 

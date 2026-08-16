@@ -1,7 +1,9 @@
 import { db } from '../db/database'
 import { getSetting } from '../db/crud'
-import type { Transaction, Debt, SavingsGoal } from '../types'
+import type { Transaction, SavingsGoal } from '../types'
 import { isImpulsive, SHOP_CATEGORIES, platformOf } from './impulseEngine'
+import { buildDebtSnapshot } from '../debt/debtContext'
+import { simulateClearDays } from '../debt/calc'
 
 // ==================== 工具 ====================
 
@@ -33,8 +35,57 @@ async function getBudget(): Promise<number> {
   const raw = await getSetting(BUDGET_KEY)
   return typeof raw === 'number' ? raw : DEFAULT_BUDGET
 }
-async function getDebts(): Promise<Debt[]> {
-  return db.debts.toArray()
+
+/** 是否信贷支付（花呗/白条/抖音月付/先用后付/信用卡/信用支付） */
+function isCreditPay(tx: Transaction): boolean {
+  const pm = String(tx.paymentMethod ?? '')
+  if (['花呗', '京东白条', '抖音月付', '先用后付', '信用卡', '信用支付'].includes(pm)) return true
+  const fs = String((tx as { fundingSource?: string }).fundingSource ?? '')
+  return ['huabei', 'baitiao', 'douyin_month', 'pdd_bnpl', 'credit_card'].includes(fs)
+}
+
+/**
+ * 债务-冲动联合统计（区间内用信贷支付的冲动消费 + 清零日累计推迟天数）：
+ * 逐账户取月还款计划（用户手填 → 本期应还 → 最低还款），用 simulateClearDays
+ * 对比"含这些消费"与"不含这些消费"的清零天数差（全由代码算，AI 不得改动数字）。
+ */
+async function creditImpulseJoint(txs: Transaction[], startTs: number, endTs: number): Promise<{
+  creditImpulseCount: number
+  creditImpulseTotal: number
+  creditClearDelayDays: number
+}> {
+  const creditTxs = txs.filter(tx =>
+    !isIncome(tx) && !isTransfer(tx) &&
+    new Date(tx.time).getTime() >= startTs && new Date(tx.time).getTime() <= endTs &&
+    isImpulsive(tx.impulseLevel) && isCreditPay(tx)
+  )
+  const total = creditTxs.reduce((s, t) => s + t.amountMinor, 0)
+  if (creditTxs.length === 0) return { creditImpulseCount: 0, creditImpulseTotal: 0, creditClearDelayDays: 0 }
+  const snapshot = await buildDebtSnapshot()
+  const byAccount = new Map<string, number>()
+  for (const t of creditTxs) {
+    const key = t.lienAccountId ?? ''
+    if (key) byAccount.set(key, (byAccount.get(key) ?? 0) + t.amountMinor)
+  }
+  let delayDays = 0
+  for (const acc of snapshot.accounts) {
+    const amt = byAccount.get(acc.account.id)
+    if (!amt || amt <= 0) continue
+    const userInst = snapshot.installments
+      .filter(i => i.accountId === acc.account.id && i.source === 'user')
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0]
+    const monthly = userInst?.principalPerMinor ?? acc.dueMinor ?? acc.minPaymentMinor ?? 0
+    if (monthly <= 0) continue
+    const before = simulateClearDays(Math.max(0, acc.principalRemMinor - amt), monthly, acc.dailyRate)
+    const after = simulateClearDays(acc.principalRemMinor, monthly, acc.dailyRate)
+    if (before === null || after === null) continue
+    delayDays += Math.max(0, after - before)
+  }
+  return {
+    creditImpulseCount: creditTxs.length,
+    creditImpulseTotal: yuan(total),
+    creditClearDelayDays: Math.round(delayDays),
+  }
 }
 async function getGoal(): Promise<SavingsGoal | null> {
   const goals = await db.savingsGoals.toArray()
@@ -167,6 +218,9 @@ export async function getDayFacts(): Promise<Record<string, unknown>> {
 
   // 今日冷静流程记录（触发过冷静流程时，报告增加"🧊 今日冷静记录"区块）
   const cooling = await getDayCooling()
+  // 债务-冲动联动（今日信贷冲动消费 → 清零日推迟，沉淀为复盘素材；信贷记一笔即自动纳入）
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const creditJoint = await creditImpulseJoint(txs, dayStart.getTime(), now.getTime())
 
   return {
     date: today,
@@ -196,6 +250,8 @@ export async function getDayFacts(): Promise<Record<string, unknown>> {
           insightSummary: cooling.insightSummary,
         }
       : null,
+    // 今日债务-冲动联动（信贷冲动消费笔数/金额/清零日累计推迟天数）
+    ...creditJoint,
   }
 }
 
@@ -312,6 +368,8 @@ export async function getWeekFacts(): Promise<Record<string, unknown>> {
   // 冲动统计
   const impulses = weekTxs.filter(tx => isImpulsive(tx.impulseLevel))
   const impulseTotal = impulses.reduce((s, tx) => s + tx.amountMinor, 0)
+  // 债务-冲动联合（本周用信贷支付的冲动消费 + 清零日累计推迟天数）
+  const creditJoint = await creditImpulseJoint(weekTxs, weekStart.getTime(), now.getTime())
   const slotDist = ['凌晨', '上午', '下午', '晚上', '深夜'].map(name => ({ slot: name, count: 0 }))
   for (const tx of impulses) {
     const row = slotDist.find(x => x.slot === slotOf(new Date(tx.time).getHours()))
@@ -453,6 +511,8 @@ export async function getWeekFacts(): Promise<Record<string, unknown>> {
     impulseDeltaPct,
     savingDeltaPct,
     highWeekdays,
+    // 债务-冲动联合分析
+    ...creditJoint,
   }
 }
 
@@ -464,7 +524,7 @@ export async function getMonthFacts(): Promise<Record<string, unknown>> {
   const prevMk = monthKeyOffset(-1)
   const budget = await getBudget()
   const txs = await getAllTxs()
-  const debts = await getDebts()
+  const debtSnapshot = await buildDebtSnapshot()
   const goal = await getGoal()
   const repay = await monthRepayAmount()
 
@@ -530,9 +590,12 @@ export async function getMonthFacts(): Promise<Record<string, unknown>> {
     .sort((a, b) => b.amount - a.amount)
     .slice(0, 5)
 
-  const debtTotal = debts.reduce((s, d) => s + d.remainingMinor, 0)
+  const debtTotal = debtSnapshot.creditPrincipalMinor
+  const debtCount = debtSnapshot.accounts.filter(a => a.principalRemMinor > 0).length
   const prevDebt = debtTotal + repay
   const debtDelta = debtTotal - prevDebt
+  // 债务-冲动联合（本月用信贷支付的冲动消费 + 清零日累计推迟天数）
+  const creditJoint = await creditImpulseJoint(txs, new Date(now.getFullYear(), now.getMonth(), 1).getTime(), now.getTime())
 
   const savingsPct = goal && goal.targetMinor > 0 ? Math.round((goal.currentMinor / goal.targetMinor) * 100) : null
 
@@ -643,7 +706,7 @@ export async function getMonthFacts(): Promise<Record<string, unknown>> {
     debtTotal: yuan(debtTotal),
     prevDebt: yuan(prevDebt),
     debtDelta: yuan(debtDelta),
-    debtCount: debts.length,
+    debtCount,
     impulseThisTotal: yuan(impulseThisTotal),
     impulseThisCount,
     impulseLastTotal: yuan(impulseLastTotal),
@@ -659,6 +722,8 @@ export async function getMonthFacts(): Promise<Record<string, unknown>> {
     debtTrend12,
     healthScore,
     healthDims,
+    // 债务-冲动联合分析
+    ...creditJoint,
   }
 }
 
@@ -794,7 +859,7 @@ export async function resolveQuery(question: string): Promise<QueryResult | null
   const q = question.replace(/\s+/g, '')
   const budget = await getBudget()
   const txs = await getAllTxs()
-  const debts = await getDebts()
+  const debtSnapshot = await buildDebtSnapshot()
   const goal = await getGoal()
 
   let monthExpense = 0
@@ -825,7 +890,8 @@ export async function resolveQuery(question: string): Promise<QueryResult | null
     }
   }
 
-  const debtTotal = debts.reduce((s, d) => s + d.remainingMinor, 0)
+  const debtTotal = debtSnapshot.creditPrincipalMinor
+  const debtCount = debtSnapshot.accounts.filter(a => a.principalRemMinor > 0).length
   const remaining = budget - monthExpense
 
   // 本月支出
@@ -864,9 +930,9 @@ export async function resolveQuery(question: string): Promise<QueryResult | null
   if (/负债|欠款|欠多少/.test(q)) {
     return {
       intent: 'debt',
-      facts: { debtTotal: yuan(debtTotal), debtCount: debts.length },
-      answer: debts.length > 0
-        ? `当前负债共 ${debts.length} 笔，合计 ${fmtYuan(debtTotal)}。`
+      facts: { debtTotal: yuan(debtTotal), debtCount },
+      answer: debtCount > 0
+        ? `当前负债共 ${debtCount} 笔，合计 ${fmtYuan(debtTotal)}。`
         : '当前没有负债，零负债保持住！',
     }
   }
@@ -921,7 +987,7 @@ export async function getAdviceFacts(): Promise<Record<string, unknown>> {
   const mk = monthKey(now)
   const budget = await getBudget()
   const txs = await getAllTxs()
-  const debts = await getDebts()
+  const debtSnapshot = await buildDebtSnapshot()
   const goal = await getGoal()
 
   let monthExpense = 0
@@ -962,7 +1028,7 @@ export async function getAdviceFacts(): Promise<Record<string, unknown>> {
     impulseCount,
     impulseTotal: yuan(impulseTotal),
     lateNightCount,
-    debtTotal: yuan(debts.reduce((s, d) => s + d.remainingMinor, 0)),
+    debtTotal: yuan(debtSnapshot.creditPrincipalMinor),
     savingsGoal: goal ? { current: yuan(goal.currentMinor), target: yuan(goal.targetMinor) } : null,
   }
 }

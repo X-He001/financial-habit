@@ -21,6 +21,7 @@ export function sanitizeHtml(html: string): string {
       'div', 'p', 'span', 'b', 'strong', 'i', 'em', 'u', 'br',
       'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
       'img', 'a', 'code', 'pre', 'blockquote', 'button',
+      'details', 'summary', // 「了解更多」折叠区（反馈卡出处唯一合法位置）
     ],
     ALLOWED_ATTR: ['style', 'class', 'href', 'src', 'alt', 'title', 'target', 'rel'],
     ALLOW_DATA_ATTR: true,

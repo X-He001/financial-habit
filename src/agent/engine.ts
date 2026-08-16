@@ -19,6 +19,7 @@ import { AGENTS, suggestQuestions } from './agents'
 import type { AgentContext, FollowUpQuestion } from './agents'
 import { getProfile } from './profile'
 import { getMonthOverview, getRecentTx } from './agents/shared'
+import { resolveTier } from '../utils/privacy'
 import DOMPurify from 'dompurify'
 
 // ==================== 类型 ====================
@@ -65,6 +66,11 @@ const RUNNING_LABEL: Record<string, string> = {
   get_schedules: '正在查询扣费日程…',
   get_recent_transactions: '正在查询最近交易…',
   get_budget_status: '正在查询预算状态…',
+  get_spending_pattern: '正在分析消费模式…',
+  get_alert_events: '正在扫描消费事件…',
+  get_behavior_profile: '正在读取你的消费画像…',
+  save_behavior_notes: '正在存档这条自我认知…',
+  get_debt_summary: '正在查询负债…',
   add_transaction: '正在记账…',
   add_wishlist_item: '正在添加欲望清单…',
   add_savings_amount: '正在存入储蓄…',
@@ -84,6 +90,11 @@ const DONE_LABEL: Record<string, string> = {
   get_schedules: '已查询扣费日程',
   get_recent_transactions: '已查询最近交易',
   get_budget_status: '已查询预算状态',
+  get_spending_pattern: '消费模式分析完成',
+  get_alert_events: '消费事件已扫描',
+  get_behavior_profile: '消费画像已读取',
+  save_behavior_notes: '自我认知已存档',
+  get_debt_summary: '负债概况已查询',
   add_transaction: '已记账',
   add_wishlist_item: '已添加欲望清单',
   add_savings_amount: '已存入储蓄',
@@ -259,7 +270,8 @@ export async function runAgent(text: string, options: AgentOptions = {}): Promis
       try {
         const tool = AGENT_TOOLS.find(t => t.name === name)
         if (!tool) throw new Error(`未知工具：${name}`)
-        result = await tool.execute(parseToolArgs(tc))
+        // 隐私分层：日常对话=档1 聚合；用户主动查单笔（"那笔/订单/明细"）→ 档3 完整单笔
+        result = await tool.execute(parseToolArgs(tc), { privacyTier: resolveTier({ userText: text }) })
       } catch (e) {
         ok = false
         result = { error: e instanceof Error ? e.message : String(e) }
@@ -281,14 +293,18 @@ export async function runAgent(text: string, options: AgentOptions = {}): Promis
 }
 
 // ============================================================================
-// 行为教练 · 冲动复盘（数据驱动）：runReview 串起 metrics → strategy → actions → context → LLM
+// 行为复盘 · 冲动复盘（数据驱动）：runReview 串起 metrics → strategy → actions → context → LLM
 // ============================================================================
 
-/** 追加到所有行为教练 AI 调用的系统提示（HTML 输出约束） */
+/** 追加到所有行为复盘 AI 调用的系统提示（HTML 输出约束） */
 export const REVIEW_SYSTEM_PROMPT =
-  '你是一个个人财务行为教练，可调用工具查询和操作用户数据。' +
+  '你是 AI 助手（财务行为分析），可调用工具查询和操作用户数据。' +
   '额外能力：净资产追踪（balance_snapshots）、自我承诺（commitments）、情绪记录（moods）、账单导入记录。' +
   '你收到的数据快照里包含了用户的真实财务数据，你必须基于这些数据说话，禁止编造数字。' +
+  '只总结不扩写：你的任务是组织语言呈现已有数据，不是根据数据推断新事实；快照/工具返回里不存在的事实一律禁止出现。' +
+  '无法确认的信息必须显式标注「未核实」或写"数据暂缺"，不得作为确定事实陈述。' +
+  '禁止把统计结论脑补成具体事实（如"重复购买率高"不得编造具体商品名/次数）；引用具体商家、金额、笔数前确认它在快照中，记不清就调用工具查证，查不到就如实说明。' +
+  '严禁向用户展示任何 0-100 的冲动分/强度分数，涉及冲动强度时只用"低/中/高/很高"等级词描述（快照里的分数只供你内部判断）。' +
   '你的回复必须是精美 HTML 片段（内联CSS、蓝白配色、主色#0040FF、数字加粗等宽字体、标题靛蓝带左侧竖条、重要信息浅琥珀框、建议浅青卡片）。' +
   '输出不要用 Markdown 语法。根据情境状态（low/impulse/high_damage）调整语气：low=轻松一句；impulse=点名模式指出规律；high_damage=给具体补偿方案。' +
   '开场白要引用真实数据（金额/时间/平台/历史次数/后悔率）。语气温和不说教。'

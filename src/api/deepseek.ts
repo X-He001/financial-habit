@@ -1,4 +1,4 @@
-import { getModelConfig, isVisionModel, DEEPSEEK_API_KEY } from './modelConfig'
+import { getModelConfig, getVisionModelConfig, isVisionModel, DEEPSEEK_API_KEY } from './modelConfig'
 import type { ModelConfig } from './modelConfig'
 import { ocrImageDataUrl } from '../utils/ocr'
 
@@ -64,6 +64,13 @@ export interface ChatCompletionOptions {
   temperature?: number
   /** 要求返回严格 JSON */
   json?: boolean
+  /**
+   * 用途分流（双模型）：
+   * - 'vision'：截图识别 / 图片记账等带图片请求 → 识图模型（未配置时回退主模型）
+   * - 'main'（默认）：AI 对话 / 报告 / 批量入账解析等纯文本 → 主模型
+   * 分流集中在本文件，页面无需关心具体配置。
+   */
+  purpose?: 'main' | 'vision'
 }
 
 async function getApiKey(): Promise<string | null> {
@@ -79,8 +86,9 @@ export async function chatCompletion(
   messages: ChatMessage[],
   options: ChatCompletionOptions = {}
 ): Promise<string> {
-  const cfg = await getModelConfig()
-  if (!cfg) throw new Error('NO_API_KEY')
+  // 双模型分流：带图片请求（purpose='vision'）用识图模型，其余纯文本用主模型
+  const cfg = options.purpose === 'vision' ? await getVisionModelConfig() : await getModelConfig()
+  if (!cfg) throw new Error(options.purpose === 'vision' ? 'NO_API_KEY' : 'NO_MAIN_MODEL')
   const key = cfg.apiKey
   const apiUrl = cfg.apiUrl.replace(/\/+$/, '')
 
@@ -383,6 +391,7 @@ export function normalizeItem(raw: Record<string, unknown> | null | undefined): 
 export function aiErrorMessage(e: unknown): string {
   const msg = e instanceof Error ? e.message : String(e)
   if (msg === 'NO_API_KEY') return '请先到设置页配置 API Key'
+  if (msg === 'NO_MAIN_MODEL') return '请先到设置页配置主模型（AI 对话与分析模型）'
   if (msg === 'NETWORK_ERROR') return '网络异常，请检查网络后重试'
   if (msg === 'TIMEOUT') return '请求超时（30秒），请稍后再试'
   if (msg === 'INVALID_KEY') return 'API Key 无效，请到设置页检查'
@@ -411,7 +420,8 @@ const SYSTEM_MSG = '你是一个记账助手，负责把交易截图或口语描
 export async function analyzeReceiptImage(imageDataUrls: string[]): Promise<ParsedLedgerItem[]> {
   if (imageDataUrls.length === 0) throw new Error('EMPTY_IMAGES')
 
-  const cfg = await getModelConfig()
+  // 双模型分流：截图识别走识图模型（未配置独立识图模型时回退主模型）
+  const cfg = await getVisionModelConfig()
   const vision = !!cfg && isVisionModel(cfg.modelName)
 
   // ---- 视觉模型：直接传图片 ----
@@ -428,7 +438,7 @@ export async function analyzeReceiptImage(imageDataUrls: string[]): Promise<Pars
           ...imageDataUrls.map(url => ({ type: 'image_url', image_url: { url } })),
         ],
       },
-    ], { json: true, temperature: 0.1 })
+    ], { json: true, temperature: 0.1, purpose: 'vision' })
 
     const rawList = parseJsonArray(content)
     return rawList.map(r => normalizeItem(r))
@@ -450,7 +460,7 @@ export async function analyzeReceiptImage(imageDataUrls: string[]): Promise<Pars
         `每项格式：{"amount": 金额（元，数字，必须识别出具体数值）, "category": "餐饮|购物|日用百货|娱乐|交通|虚拟消费|其他", "merchant": "商家名称", "time": "交易日期（YYYY-MM-DD）", "paymentMethod": "微信|支付宝|银行卡|现金|先用后付|分期", "note": "备注或空字符串"}。无法识别的图对应元素返回 null。\n\n` +
         texts.map((t, i) => `【第 ${i + 1} 张】\n${t || '（未能识别出文字）'}`).join('\n\n'),
     },
-  ], { json: true, temperature: 0.1 })
+  ], { json: true, temperature: 0.1, purpose: 'vision' })
 
   const rawList = parseJsonArray(content)
   return rawList.map(r => normalizeItem(r))
@@ -475,7 +485,8 @@ const MULTI_COMMON_RULE =
 export async function analyzeReceiptImagesMulti(imageDataUrls: string[]): Promise<ParsedLedgerItem[]> {
   if (imageDataUrls.length === 0) throw new Error('EMPTY_IMAGES')
 
-  const cfg = await getModelConfig()
+  // 双模型分流：批量识图同样走识图模型（未配置独立识图模型时回退主模型）
+  const cfg = await getVisionModelConfig()
   const vision = !!cfg && isVisionModel(cfg.modelName)
 
   const toItem = (r: Record<string, unknown>): ParsedLedgerItem => ({
@@ -501,7 +512,7 @@ export async function analyzeReceiptImagesMulti(imageDataUrls: string[]): Promis
           ...imageDataUrls.map(url => ({ type: 'image_url', image_url: { url } })),
         ],
       },
-    ], { json: true, temperature: 0.1 })
+    ], { json: true, temperature: 0.1, purpose: 'vision' })
     return toItems(extractJsonList(content))
   }
 
@@ -542,7 +553,7 @@ export async function analyzeReceiptImagesMulti(imageDataUrls: string[]): Promis
         `${MULTI_COMMON_RULE}\n每条记录格式：${MULTI_ITEM_SCHEMA}\n\n` +
         texts.map((t, i) => `【第 ${i + 1} 张】\n${t || '（未能识别出文字）'}`).join('\n\n'),
     },
-  ], { json: true, temperature: 0.1 })
+  ], { json: true, temperature: 0.1, purpose: 'vision' })
 
   const rawList = extractJsonList(content)
   return toItems(rawList)
@@ -576,7 +587,9 @@ export async function testModelConnection(cfg: ModelConfig): Promise<ConnectionT
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 8,
+        // 推理模型（如 deepseek-v4-flash）会先输出思考过程再回答；
+        // 若 max_tokens 过小（如 8）会被思考吃光导致 content 为空而误报失败，故放宽到 256
+        max_tokens: 256,
         temperature: 0,
         stream: false,
       }),
@@ -686,6 +699,7 @@ export async function generateReport(
 内容要点：
 - 今日收支：今日支出总额，Top3 笔（商家+金额）、今日收入
 - 今日冲动：冲动笔数（为 0 要给表扬）
+- 今日债务联动：如果 facts.creditImpulseCount 大于 0，用一条 [insight] 指出今天有 creditImpulseCount 笔冲动消费用了信贷支付、合计 ¥creditImpulseTotal、让清零日累计推迟约 creditClearDelayDays 天（数字只取 facts 对应字段，不得改动或另算）；否则一句带过"今天没有信贷冲动消费"
 - 今日冷静记录：如果 facts.coolingStats 存在且 triggerCount>0，在 insight 里用一条概括「🧊 今日冷静记录」：今天触发冷静流程 X 次、拦截（放清单/取消）金额合计 ¥Y、拆解要点用一句概括。引用数字只限 coolingStats 内的 triggerCount / blockedMinor，不要逐条复述拆解文案里的金额
 - 明日建议：根据本月剩余预算和日均消费，给出明日可花额度建议
 - 昨日承诺引用：如果 facts.yesterdayPromise 存在，用一条 [text] 或 [insight] 引用（如：昨天你承诺『${'${facts.yesterdayPromise}'}』，今天做到了吗？），引用承诺时不要重复写出具体金额`
@@ -696,6 +710,7 @@ export async function generateReport(
 - 消费结构：本周各分类占比（Top 分类）
 - 情绪模式：基于冲动时段分布判断（深夜冲动多=压力型/报复性熬夜购物，白天高频小额=无聊型，大额偶发=FOMO型）——直接采用 facts 里给出的判断，不要自己猜
 - 冲动分析：本周冲动总额、冲动次数
+- 债务-冲动联合：如果 facts.creditImpulseCount 大于 0，在 [insight] 里指出本周有 creditImpulseCount 笔冲动消费用了信贷支付、合计 ¥creditImpulseTotal、让清零日累计推迟约 creditClearDelayDays 天（数字只取 facts.creditImpulseCount / creditImpulseTotal / creditClearDelayDays 中的值，不得改动或另算）；否则用一句"本周没有信贷冲动消费"带过
 - 改进建议：1-3 条具体可执行的建议（基于真实数据，如"本周深夜消费 3 次共 ¥XX，建议设置 22 点后冷静提醒"）`
       : `【每月复盘】用块标记输出，建议包含：1 个 [stat]（总支出/预算/结余）、1 个 [progress]（预算执行率）、1 个 [bars]（分类占比）、1-2 条 [insight]、2-3 条 [tip] 下月建议、1 个 [conclusion]。
 内容要点：
@@ -704,6 +719,7 @@ export async function generateReport(
 - 储蓄分析：储蓄进度
 - 债务分析：负债变化
 - 冲动趋势：本月冲动与上月对比
+- 债务-冲动联合：如果 facts.creditImpulseCount 大于 0，在 [insight] 里指出本月有 creditImpulseCount 笔冲动消费用了信贷支付、合计 ¥creditImpulseTotal、让清零日累计推迟约 creditClearDelayDays 天（数字只取 facts 中对应字段，不得改动或另算）；否则用一句"本月没有信贷冲动消费"带过
 - 下月建议：3 条具体建议`
 
   return chatCompletion([
@@ -783,9 +799,10 @@ export async function generateImpulseAnalysis(facts: Record<string, unknown>): P
     {
       role: 'system',
       content: '你是一名消费行为分析师。只基于 facts（JSON）分析用户的冲动消费情况，数字必须来自 facts，严禁编造 facts 中不存在的数字。' +
-        '输出必须遵循"结论 + 证据"格式：每个结论必须引用 facts 中的真实数字（金额、笔数、占比、时段、平台、冲动指数），并标注证据来源（如"见平台环形图""见时段柱状图""见热力图"）。' +
+        '输出必须遵循"结论 + 证据"格式：每个结论必须引用 facts 中的真实数字（金额、笔数、占比、时段、平台），并标注证据来源（如"见平台环形图""见时段柱状图""见热力图"）。' +
+        '严禁向用户展示 0-100 的冲动指数/强度分数，涉及冲动强度时只用"低/中/高/很高"等级词描述。' +
         '每个结论必须能在界面图表中找到对应数据。' +
-        '结构：1）一句话结论（如"本月冲动消费 8 笔共 ¥278"）；2）2-3 条证据（如"75% 金额集中在拼多多，见平台环形图""50% 发生在凌晨 0-2 点，见时段柱状图""最大单笔 ¥89、冲动指数 57 分"）；3）2 条具体可执行建议。' +
+        '结构：1）一句话结论（如"本月冲动消费 8 笔共 ¥278"）；2）2-3 条证据（如"75% 金额集中在拼多多，见平台环形图""50% 发生在凌晨 0-2 点，见时段柱状图""最大单笔 ¥89、冲动强度高"）；3）2 条具体可执行建议。' +
         '不超过 250 字，用 Markdown 分点。',
     },
     {
@@ -803,7 +820,7 @@ export async function generateMoodInsight(stats: Record<string, unknown>): Promi
   return chatCompletion([
     {
       role: 'system',
-      content: '你是一名个人财务行为教练。你只基于用户提供的真实统计数据（stats，JSON）说话，数字必须全部来自 stats，禁止编造 stats 中没有的数字。' +
+      content: '你是 AI 助手（财务行为分析）。你只基于用户提供的真实统计数据（stats，JSON）说话，数字必须全部来自 stats，禁止编造 stats 中没有的数字。' +
         '输出必须是精美 HTML 片段（内联CSS、蓝白配色、主色#0040FF、数字加粗等宽字体、标题靛蓝带左侧竖条、重要信息浅琥珀框、建议浅青卡片），禁止使用 Markdown 语法。' +
         '语气温和不说教。结构：1 条"发现"（引用真实数字，如压力大的日子日均消费比平静日高 X%）+ 1-2 条具体建议（如压力大时先散步 20 分钟再决定是否消费）。',
     },
@@ -839,8 +856,8 @@ export async function generateReviewTurn(
     Q3: '本轮：引导用户为明天定一个小目标（方向：控制明天购物支出、明天不逛购物平台、把冲动的钱存起来），给出引导语即可。',
     summary: '本轮：这是最后一轮。请汇总前面对话中用户的全部回答，输出一段 3-5 句的鼓励收尾：肯定他的觉察、复述他明天的承诺、给一句有力量的话。',
   }
-  const system = `你是一名消费心理复盘教练，像朋友一样温和地引导用户反思，绝不评判、不啰嗦。\n你只输出本轮要显示给用户的一句话文本：不带选项按钮、不带序号前缀、不用 Markdown 标记。\n所有数字必须来自用户提供的 facts，绝不编造。\n${stepGuide[step]}`
-  const user = `当日冲动复盘数据（JSON）：\n\`\`\`json\n${JSON.stringify(facts, null, 2)}\n\`\`\`\n\n对话历史：\n${history.map(m => `${m.role === 'assistant' ? '教练' : '用户'}：${m.content}`).join('\n')}\n\n请生成本轮${step === 'summary' ? '鼓励总结' : '追问'}文本。`
+  const system = `你是 AI 助手，像朋友一样温和地引导用户反思，绝不评判、不啰嗦。\n你只输出本轮要显示给用户的一句话文本：不带选项按钮、不带序号前缀、不用 Markdown 标记。\n所有数字必须来自用户提供的 facts，绝不编造。\n${stepGuide[step]}`
+  const user = `当日冲动复盘数据（JSON）：\n\`\`\`json\n${JSON.stringify(facts, null, 2)}\n\`\`\`\n\n对话历史：\n${history.map(m => `${m.role === 'assistant' ? 'AI 助手' : '用户'}：${m.content}`).join('\n')}\n\n请生成本轮${step === 'summary' ? '鼓励总结' : '追问'}文本。`
 
   try {
     const content = await chatCompletion([

@@ -5,6 +5,7 @@ import type {
   BalanceSnapshot, Commitment, Mood,
   ConsumerEvent, DecisionRecord, BehaviorProfile, Insight,
   CreditAccount, CreditStatement, Installment,
+  KnowledgeRef, FeedbackLog, AgentInboxItem,
 } from '../types'
 
 class FinancialDB extends Dexie {
@@ -30,6 +31,9 @@ class FinancialDB extends Dexie {
   creditAccounts!: Table<CreditAccount, string>
   creditStatements!: Table<CreditStatement, string>
   installments!: Table<Installment, string>
+  knowledgeRefs!: Table<KnowledgeRef, string>
+  feedbackLogs!: Table<FeedbackLog, string>
+  agentInbox!: Table<AgentInboxItem, string>
 
   constructor() {
     super('financial-habit-db')
@@ -188,6 +192,35 @@ class FinancialDB extends Dexie {
       creditAccounts: 'id, platform, nickname',
       creditStatements: 'id, accountId, period, status, dueDate',
       installments: 'id, accountId, txId',
+    })
+
+    // v10：F5 购买反馈 Agent 循环（knowledge_refs 知识库 / feedback_logs 效果日志 / agent_inbox 展示队列）
+    this.version(10).stores({
+      transactions: 'id, category, time, txType',
+      accounts: 'id, name',
+      savingsGoals: 'id, isActive',
+      sinkingFunds: 'id, name',
+      wishlist: 'id, status, coolingEndsAt',
+      wishlistChats: 'id, wishlistId',
+      debts: 'id, name',
+      savingsRules: 'id, type, enabled',
+      notificationLogs: 'id, type, sentAt',
+      categories: 'id, name',
+      schedules: 'id, type, date, repeat',
+      settings: 'id, value',
+      balanceSnapshots: 'id, date',
+      commitments: 'id, status, deadline',
+      moods: 'id, date, mood',
+      consumerEvents: 'id, txId, time, category, triggerType, isImpulse, createdAt',
+      decisionRecords: 'id, relatedType, relatedId, createdAt',
+      behaviorProfiles: 'id',
+      insights: 'id, type, createdAt, acknowledged, sourceKey',
+      creditAccounts: 'id, platform, nickname',
+      creditStatements: 'id, accountId, period, status, dueDate',
+      installments: 'id, accountId, txId',
+      knowledgeRefs: 'id, category, concept, status',
+      feedbackLogs: 'id, type, objectType, objectId, effectStatus, createdAt',
+      agentInbox: 'id, kind, status, scheduledAt, createdAt',
     })
   }
 }

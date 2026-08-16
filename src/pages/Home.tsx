@@ -5,25 +5,29 @@ import {
   PieChart, Pie, Cell, LabelList,
 } from 'recharts'
 import { db } from '../db/database'
-import type { Transaction, SavingsGoal, Category, Schedule, ConsumerEvent } from '../types'
+import type { Transaction, SavingsGoal, Category, Schedule, ConsumerEvent, AgentInboxItem } from '../types'
 import {
   addTransaction, addSavingsGoal, updateSavingsGoal,
-  addSchedule, updateSchedule, deleteSchedule, setSetting, getSetting, addWishlistItem,
+  addSchedule, updateSchedule, deleteSchedule, setSetting, getSetting,
+  getDueAgentInboxItems,
 } from '../db/crud'
 import DashboardCard from '../components/cards/DashboardCard'
 import Markdown from '../components/Markdown'
 import { generateImpulseAnalysis, hasApiKey, aiErrorMessage } from '../api/deepseek'
 import { getImpulseFacts } from '../utils/aiFacts'
 import { impulseTemplate, verifyAiNumbers } from '../utils/reportTemplates'
+import { CORRECTED_BY_SYSTEM } from '../utils/factGuard'
 import { incrementAiCount } from '../utils/aiUsage'
 import { isImpulsive, platformOf } from '../utils/impulseEngine'
 import { ForecastBanner } from '../components/ReviewPanel'
 import ProactiveBanner from '../components/ProactiveBanner'
+import FeedbackCard from '../components/FeedbackCard'
+import { runFeedbackScan } from '../agent/feedbackEngine'
 import MoodSelector from '../components/MoodSelector'
 import { computeFragileWindows, getFragileWindowNow } from '../agent/metrics'
 import { submitPurchaseFeedback } from '../agent/profile'
 import { getPendingFeedback } from '../agent/decisionEngine'
-import { buildDebtSnapshot } from '../debt/debtContext'
+import { buildDebtSnapshot, type DebtSnapshot } from '../debt/debtContext'
 import {
   SlotBarChart, CategoryRing, HBarList, StrengthBars, Heatmap, TxSheet, ActionBtn,
   type SlotRow, type TxItem, type HeatCell,
@@ -93,13 +97,13 @@ function slotOf(h: number): string {
   if (h < 22) return '晚上'
   return '深夜'
 }
-// 交易 → 下钻弹层条目（冲动指数标记为红字 extra）
+// 交易 → 下钻弹层条目（冲动等级标记为红字 extra，不展示 0-100 分）
 function txToItem(tx: Transaction): TxItem {
   return {
     merchant: tx.merchant,
     amount: Math.round(tx.amountMinor / 100),
     sub: `${new Date(tx.time).toTimeString().slice(0, 5)} · ${tx.category} · ${tx.paymentMethod}`,
-    extra: `冲动${tx.impulseScore}分`,
+    extra: `冲动·${IMPULSE_LEVEL_LABEL[tx.impulseLevel]}`,
   }
 }
 
@@ -170,7 +174,8 @@ function FeedbackBlock() {
   const [enabled, setEnabled] = useState(true)
 
   async function load() {
-    const rawFlag = await getSetting('feedbackReminderEnabled')
+    // F4：与「AI 购买反馈卡」总开关联动（旧的 feedbackReminderEnabled 已并入）
+    const rawFlag = await getSetting('feedbackCardEnabled')
     const on = rawFlag !== 'false'
     setEnabled(on)
     if (!on) { setItems([]); return }
@@ -270,6 +275,56 @@ function FeedbackBlock() {
   )
 }
 
+// ==================== F5 反馈卡 / 7.7 窗口提醒队列 ====================
+
+/**
+ * agent_inbox 到期队列（scheduledAt 已到且未处理）：
+ * - feedback_card：购买反馈卡（对象A/对象B/正面强化），交互式对话（F5 7.5/7.6）
+ * - impulse_window：高频冲动窗口提醒（7.7），接受→写 settings 真实生效
+ * 每日首次进入首页时触发 runFeedbackScan（生成/回查/窗口分析，localStorage 防抖一天一次）。
+ */
+function AgentInboxBlock() {
+  const [items, setItems] = useState<AgentInboxItem[]>([])
+
+  async function load() {
+    // F4：AI 购买反馈卡开关（settings.feedbackCardEnabled）——关闭时不展示反馈卡，7.7 窗口卡不受影响
+    const on = (await getSetting('feedbackCardEnabled')) !== 'false'
+    const list = await getDueAgentInboxItems()
+    setItems(on ? list : list.filter(i => i.kind !== 'feedback_card'))
+  }
+
+  useEffect(() => {
+    void load()
+    // 每日扫描防抖：12 小时内最多跑一次（跑完即时刷新队列）
+    const SCAN_KEY = 'feedbackScanLastRun'
+    try {
+      const last = Number(localStorage.getItem(SCAN_KEY) || 0)
+      if (Date.now() - last > 12 * 3600_000) {
+        localStorage.setItem(SCAN_KEY, String(Date.now()))
+        void runFeedbackScan()
+          .then(res => { if (res.generated.some(g => g.queued) || res.windowQueued) void load() })
+          .catch(() => { /* 无 API 键/网络失败时静默，次日再试 */ })
+      }
+    } catch { /* localStorage 不可用 */ }
+    const h = () => void load()
+    window.addEventListener('dashboard-refresh', h)
+    window.addEventListener('impulse-saved', h)
+    return () => {
+      window.removeEventListener('dashboard-refresh', h)
+      window.removeEventListener('impulse-saved', h)
+    }
+  }, [])
+
+  if (items.length === 0) return null
+  return (
+    <>
+      {items.map(item => (
+        <FeedbackCard key={item.id} item={item} onDone={() => void load()} />
+      ))}
+    </>
+  )
+}
+
 // ==================== 主组件 ====================
 
 export default function Home() {
@@ -279,6 +334,8 @@ export default function Home() {
   const [goal, setGoal] = useState<SavingsGoal | null>(null)
   // 全部负债（旧自定义债务 + 花呗/白条等负债账户）已由 debtSnapshot 统一，供首页负债卡/三维分析联动
   const [creditDebt, setCreditDebt] = useState<{ totalMinor: number; items: { name: string; remainingMinor: number; realApr: number }[] }>({ totalMinor: 0, items: [] })
+  // 完整债务快照（还款倒计时用真实还款计划计算，数字全部由代码算）
+  const [debtSnapshot, setDebtSnapshot] = useState<DebtSnapshot | null>(null)
   const [categories, setCategories] = useState<Category[]>([])
   const [schedules, setSchedules] = useState<Schedule[]>([])
   const [monthlyBudget, setMonthlyBudget] = useState(DEFAULT_BUDGET_MINOR)
@@ -302,6 +359,7 @@ export default function Home() {
   const [showFragileTip, setShowFragileTip] = useState(true)
   // 冲动 AI 解读
   const [aiImpulse, setAiImpulse] = useState<{ text: string } | null>(null)
+  const [aiImpulseCorrected, setAiImpulseCorrected] = useState(false)
   const [aiImpulseLoading, setAiImpulseLoading] = useState(false)
   // 下钻明细弹层 + "已生效"提示
   const [sheet, setSheet] = useState<{ title: string; txs: TxItem[] } | null>(null)
@@ -332,6 +390,7 @@ export default function Home() {
     setTomorrowLimit(dl)
     // 新负债账户（花呗/白条/月付/先用后付/信用卡）待还，合并进首页负债口径
     const debtSnap = await buildDebtSnapshot()
+    setDebtSnapshot(debtSnap)
     setCreditDebt({
       totalMinor: debtSnap.creditPrincipalMinor,
       items: debtSnap.accounts
@@ -501,6 +560,28 @@ export default function Home() {
       .sort((a, b) => b.amount - a.amount)
   }, [impulseList])
 
+  // ========== 快捷功能数据（F2：近5笔大额 / 平台·商家 Top3） ==========
+
+  // 全部消费（非收入 / 非转账）——快捷功能只看消费侧
+  const spendTxs = useMemo(() => txs.filter(tx => !isIncome(tx) && !isTransfer(tx)), [txs])
+  // 近 5 笔大额：按金额降序取前 5
+  const topLargeTxs = useMemo(() =>
+    [...spendTxs].sort((a, b) => b.amountMinor - a.amountMinor).slice(0, 5), [spendTxs])
+  // 平台 Top3 / 商家 Top3：按金额聚合降序
+  const topPlatformMerchant = useMemo(() => {
+    const byPlatform: Record<string, { amount: number; count: number }> = {}
+    const byMerchant: Record<string, { amount: number; count: number }> = {}
+    for (const tx of spendTxs) {
+      const p = platformOf(tx.merchant) ?? '其他'
+      byPlatform[p] = { amount: (byPlatform[p]?.amount ?? 0) + tx.amountMinor, count: (byPlatform[p]?.count ?? 0) + 1 }
+      byMerchant[tx.merchant] = { amount: (byMerchant[tx.merchant]?.amount ?? 0) + tx.amountMinor, count: (byMerchant[tx.merchant]?.count ?? 0) + 1 }
+    }
+    const top = (m: Record<string, { amount: number; count: number }>) =>
+      Object.entries(m).map(([name, v]) => ({ name, amount: Math.round(v.amount / 100), count: v.count }))
+        .sort((a, b) => b.amount - a.amount).slice(0, 3)
+    return { platforms: top(byPlatform), merchants: top(byMerchant) }
+  }, [spendTxs])
+
   // 冲动强度分布（高/中/低三档笔数）
   const impulseStrength = useMemo(() => {
     let high = 0, medium = 0, low = 0
@@ -610,15 +691,29 @@ export default function Home() {
   // ========== 负债 ==========
 
   const debtTotal = useMemo(() => creditDebt.totalMinor, [creditDebt])
+  // 还款倒计时（数字由代码算）：月还款取用户设定分期 principalPerMinor 合计，无分期则取本期应还 dueMinor；
+  // 两者都没有 → 不估算清零月（显示"未设置还款计划"），绝不硬编码默认期数
   const payoffInfo = useMemo(() => {
+    if (!debtSnapshot) return []
     const now = new Date()
-    return creditDebt.items.map(it => {
-      const pay = Math.max(100_00, Math.round(it.remainingMinor / 6))
-      const months = Math.max(1, Math.ceil(it.remainingMinor / pay))
-      const zeroDate = new Date(now.getFullYear(), now.getMonth() + months, 1)
-      return { key: 'credit-' + it.name, name: it.name, remainingMinor: it.remainingMinor, apr: it.realApr, pay, months, zeroDate }
-    })
-  }, [creditDebt])
+    return debtSnapshot.accounts
+      .filter(a => a.principalRemMinor > 0)
+      .map(a => {
+        const name = `${a.account.platform}${a.account.nickname && a.account.nickname !== a.account.platform ? '·' + a.account.nickname : ''}`
+        const insts = debtSnapshot.installments.filter(i => i.accountId === a.account.id)
+        // 历史兼容：优先用用户手动填写的还款计划（source='user'），旧版按金额自动推算的分期仍保留不删改，
+        // 仅在有手动计划时不再参与月还款估算，避免"自动 6 期"旧数据造成清零月虚增
+        const userInsts = insts.filter(i => i.source === 'user')
+        const monthly = (userInsts.length > 0 ? userInsts : insts).reduce((s, i) => s + i.principalPerMinor, 0) || a.dueMinor || 0
+        if (monthly <= 0) {
+          return { key: 'credit-' + name, name, remainingMinor: a.principalRemMinor, apr: a.realApr, pay: 0, months: null, zeroDate: null }
+        }
+        const pay = Math.max(100, monthly)
+        const months = Math.ceil(a.principalRemMinor / pay)
+        const zeroDate = new Date(now.getFullYear(), now.getMonth() + months, 1)
+        return { key: 'credit-' + name, name, remainingMinor: a.principalRemMinor, apr: a.realApr, pay, months, zeroDate }
+      })
+  }, [debtSnapshot])
 
   // 最近记录
   const recentTxs = useMemo(() =>
@@ -649,6 +744,20 @@ export default function Home() {
   const monthDueTotal = useMemo(() => monthSchedules.reduce((s, x) => s + x.amountMinor, 0), [monthSchedules])
   // 本月还款（日程中 type=debt 的合计）
   const monthRepay = useMemo(() => monthSchedules.filter(s => s.type === 'debt').reduce((s, x) => s + x.amountMinor, 0), [monthSchedules])
+
+  // ========== 今日 AI 总结入口 · 今日要点（数字由本地代码算出） ==========
+  const todayBrief = useMemo(() => {
+    const t = todayStr()
+    let expense = 0, count = 0, impulse = 0
+    for (const tx of txs) {
+      if (isIncome(tx) || isTransfer(tx)) continue
+      if (dateKey(new Date(tx.time)) !== t) continue
+      expense += tx.amountMinor
+      count++
+      if (tx.impulseLevel === 'high' || tx.impulseLevel === 'veryHigh') impulse++
+    }
+    return { expense, count, impulse }
+  }, [txs])
 
   // ========== 三维综合分析（支出 / 储蓄 / 负债） ==========
 
@@ -761,6 +870,7 @@ export default function Home() {
     }
     setAiImpulseLoading(true)
     setAiImpulse(null)
+    setAiImpulseCorrected(false)
     try {
       const facts = await getImpulseFacts()
       let text = ''
@@ -768,7 +878,11 @@ export default function Home() {
       await incrementAiCount()
       try {
         text = await generateImpulseAnalysis(facts)
-        if (!verifyAiNumbers(text, facts)) text = impulseTemplate(facts)
+        if (!verifyAiNumbers(text, facts)) {
+          // 渲染层兜底校验：AI 数字与真实数据不符 → 系统校正为代码模板
+          text = impulseTemplate(facts)
+          setAiImpulseCorrected(true)
+        }
       } catch (e) {
         text = impulseTemplate(facts)
         text += `\n\n（AI 解读失败：${aiErrorMessage(e)}，已展示本地计算结果）`
@@ -1165,16 +1279,14 @@ export default function Home() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginTop: 12 }}>
               <MiniStat label="冲动总笔数" value={`${impulseList.length} 笔`} />
               <MiniStat label="最大单笔冲动" value={maxImpulse ? `${maxImpulse.merchant} ${fmtS(maxImpulse.amountMinor)}` : '—'} />
-              <MiniStat label="平均冲动指数" value={`${avgScore} 分`} />
+              <MiniStat label="平均冲动强度" value={avgScore <= 30 ? '低' : avgScore <= 50 ? '中' : avgScore <= 70 ? '高' : '很高'} />
             </div>
 
-            {/* ① 冲动平台排行（横向条形图，靛蓝渐变） */}
-            {impulsePlatformAmounts.length > 0 && (
-              <div style={{ marginTop: 14 }}>
-                <div style={{ fontSize: 12, color: '#888888', marginBottom: 6 }}>① 冲动平台排行（按金额）</div>
-                <HBarList data={impulsePlatformAmounts.map(p => ({ name: p.name, value: p.amount }))} />
-              </div>
-            )}
+            {/* ① 冲动平台排行（横向条形图，靛蓝渐变；无数据时显示空状态） */}
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontSize: 12, color: '#888888', marginBottom: 6 }}>① 冲动平台排行（按金额）</div>
+              <HBarList data={impulsePlatformAmounts.map(p => ({ name: p.name, value: p.amount }))} />
+            </div>
 
             {/* ② 冲动金额占比（环形图，中心=总冲动金额） */}
             {impulsePlatformAmounts.length > 0 && (
@@ -1216,24 +1328,15 @@ export default function Home() {
                 toastIt('已生效：凌晨消费锁已开启（0:00-2:00 购物记账二次确认）')
               }}>🔒 开启凌晨消费锁</ActionBtn>
               <ActionBtn color="#F59E0B" onClick={() => {
-                const top = impulsePlatformAmounts[0]
-                const name = top ? top.name : '拼多多'
-                const now = new Date()
-                void (async () => {
-                  await addWishlistItem({
-                    name,
-                    priceMinor: top ? top.amount * 100 : 0,
-                    addedAt: now.toISOString(),
-                    coolingDays: 1,
-                    coolingEndsAt: new Date(now.getTime() + 86_400_000).toISOString(),
-                    status: 'cooling',
-                    aiAnalysis: null,
-                    finalPriceMinor: null,
-                    boughtAt: null,
-                  })
-                })()
-                toastIt(`已生效：${name} 已加入欲望清单冷静 1 天（冲动平台防护）`)
-              }}>🛒 把{impulsePlatformAmounts[0]?.name ?? '拼多多'}加入欲望清单</ActionBtn>
+                setSheet({ title: '近 5 笔大额消费（全部时间）', txs: topLargeTxs.map(txToItem) })
+              }}>🔝 近5笔大额</ActionBtn>
+              <ActionBtn color="#0040FF" onClick={() => {
+                const txs = [
+                  ...topPlatformMerchant.platforms.map(p => ({ merchant: `平台 · ${p.name}`, amount: p.amount, sub: `${p.count} 笔` })),
+                  ...topPlatformMerchant.merchants.map(m => ({ merchant: `商家 · ${m.name}`, amount: m.amount, sub: `${m.count} 笔` })),
+                ]
+                setSheet({ title: '平台 / 商家 Top3（按消费金额）', txs })
+              }}>🏆 平台/商家Top3</ActionBtn>
               <ActionBtn color="#0040FF" onClick={() => {
                 setSheet({ title: '最近 5 次冲动记录', txs: recentImpulseItems })
               }}>📋 查看过去5次冲动记录</ActionBtn>
@@ -1257,6 +1360,11 @@ export default function Home() {
                 padding: '12px 14px', fontSize: 13, color: '#f59e0b', lineHeight: 1.8,
               }}>
                 <Markdown md={aiImpulse.text} />
+                {aiImpulseCorrected && (
+                  <div style={{ marginTop: 8, fontSize: 11.5, color: '#888888', lineHeight: 1.6 }}>
+                    🛡️ {CORRECTED_BY_SYSTEM}：AI 解读与真实数据有出入，已改用本地计算结果展示
+                  </div>
+                )}
               </div>
             )}
           </>
@@ -1334,7 +1442,8 @@ export default function Home() {
   }
 
   function payoffCard(_large: boolean) {
-    const latest = payoffInfo.length > 0 ? payoffInfo[0].zeroDate : null
+    const dated = payoffInfo.filter(d => d.zeroDate !== null)
+    const latest = dated.length > 0 ? new Date(Math.min(...dated.map(d => (d.zeroDate as Date).getTime()))) : null
     return (
       <DashboardCard title="还款倒计时" onExpand={() => setExpanded('payoff')}>
         {payoffInfo.length === 0 ? (
@@ -1347,6 +1456,7 @@ export default function Home() {
                 {latest ? `${latest.getFullYear()}年${latest.getMonth() + 1}月` : '—'}
               </b>{' '}
               全部清零
+              {!latest && <span style={{ fontSize: 12, color: '#F59E0B' }}>（按当前还款计划）</span>}
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 12 }}>
               {payoffInfo.map(d => (
@@ -1356,10 +1466,16 @@ export default function Home() {
                     <span style={{ fontSize: 13, fontWeight: 700, color: '#22D3EE', fontVariantNumeric: 'tabular-nums' }}>{fmtS(d.remainingMinor)}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#888888', marginTop: 4, flexWrap: 'wrap', gap: 4 }}>
-                    <span>月还 {fmtS(d.pay)} · 利率 {d.apr}%</span>
-                    <span>预计 <b style={{ color: '#111111' }}>{d.zeroDate.getFullYear()}年{d.zeroDate.getMonth() + 1}月</b> 清零（{d.months} 个月）</span>
+                    <span>月还 {d.months ? fmtS(d.pay) : '—'} · 利率 {d.apr}%</span>
+                    {d.months && d.zeroDate ? (
+                      <span>预计 <b style={{ color: '#111111' }}>{d.zeroDate.getFullYear()}年{d.zeroDate.getMonth() + 1}月</b> 清零（{d.months} 个月）</span>
+                    ) : (
+                      <span style={{ color: '#F59E0B' }}>未设置还款计划</span>
+                    )}
                   </div>
-                  <div style={{ marginTop: 6 }}><MiniProgress pct={(1 / d.months) * 100} color="#22D3EE" height={5} /></div>
+                  {d.months && (
+                    <div style={{ marginTop: 6 }}><MiniProgress pct={(1 / d.months) * 100} color="#22D3EE" height={5} /></div>
+                  )}
                 </div>
               ))}
             </div>
@@ -1574,6 +1690,9 @@ export default function Home() {
       {/* AI 主动提醒：连续3晚购物 / 储蓄达标 / 债务下降 / 新洞察 / 30天回访 */}
       <ProactiveBanner />
 
+      {/* F5 反馈卡 + 7.7 高频冲动窗口提醒队列（scheduledAt 到期后展示） */}
+      <AgentInboxBlock />
+
       {/* 高频冲动窗口温和提示条 */}
       <ForecastBanner />
 
@@ -1641,6 +1760,34 @@ export default function Home() {
           </button>
         </div>
       )}
+
+      {/* ===== 今日 AI 总结入口：今日要点 + 一键进入报告页 ===== */}
+      <div style={{ marginBottom: 12 }}>
+        <div className="card" style={{
+          padding: 16, display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
+          background: 'linear-gradient(135deg,#EEF2FF,#F0F9FF)', border: '1px solid #C7D2FE',
+        }}>
+          <div style={{ flex: 1, minWidth: 220 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: '#111111', marginBottom: 6 }}>🤖 今日 AI 总结</div>
+            <div style={{ fontSize: 12.5, color: '#888888', lineHeight: 1.8 }}>
+              今日支出 <b style={{ color: '#0040FF' }}>{fmtS(todayBrief.expense)}</b>（{todayBrief.count} 笔）
+              {todayBrief.impulse > 0 && <> · 冲动 <b style={{ color: '#F43F5E' }}>{todayBrief.impulse} 笔</b></>}
+              {' · '}预算剩余 <b style={{ color: remaining < 0 ? '#F43F5E' : '#0040FF' }}>{fmtS(Math.max(0, remaining))}</b>
+            </div>
+            <div style={{ fontSize: 11.5, color: '#A0A4A4', marginTop: 4 }}>
+              AI 自主查数据、分析并生成 HTML 总结（今日/每周/每月），报告下还可继续交互式复盘
+            </div>
+          </div>
+          <button onClick={() => navigate('/report')}
+            style={{
+              padding: '10px 20px', borderRadius: 10, border: 'none', background: '#0040FF', color: '#FFFFFF',
+              fontSize: 13.5, fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font-stack)', flexShrink: 0,
+              boxShadow: '0 4px 12px rgba(0,64,255,0.3)', transition: 'opacity 0.15s',
+            }}>
+            ✨ 查看今日总结 →
+          </button>
+        </div>
+      </div>
 
       {/* ===== 监控看板网格 ===== */}
 

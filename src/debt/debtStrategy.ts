@@ -152,6 +152,7 @@ const CFA_SYSTEM_PROMPT =
   '3.不制造焦虑，给具体动作。' +
   '4.某笔债真实利率高于储蓄收益，明确说"先还这笔再储蓄"。' +
   '5.检测到最低还款滚存，点明利滚利并给补救金额。' +
+  '6.债务数字纪律（四字段尤其严格）：只能使用【债务快照】里代码算好的数据；利率/金额/天数/日期四字段只能原样引用，未返回的数字一律不得输出；不确定就再查或明说"这部分数据没有查到"，绝不估算、绝不编造。' +
   '输出：结论一句话+证据（用了哪些数）+3个可执行动作（带按钮）。' +
   '输出为精美HTML（内联CSS、蓝白配色、数字加粗等宽），禁止Markdown，禁止```html包裹，只输出HTML内容本身。' +
   '动作按钮必须用以下格式（data-action 值固定，禁止改动）：' +
@@ -159,7 +160,89 @@ const CFA_SYSTEM_PROMPT =
   '<button data-action="extra500">本月多还 ¥500</button> / <button data-action="savings">调整储蓄目标</button> / <button data-action="remind">设还款提醒</button>，' +
   '按钮要带内联样式（蓝白配色、圆角、合适 padding），放在回答末尾的按钮组里。'
 
-/** 债务顾问入口：算法算情境 → AI 组织语言（无 Key 本地降级） */
+/** 代码算好的债务"事实数据块"（渲染层兜底校验的唯一事实源） */
+export function buildDebtFactBlock(s: DebtSnapshot, m: DebtMetrics): { percents: number[]; yuanValues: number[]; dates: string[] } {
+  const percents: number[] = [s.avgRealApr, m.debtIncomePct]
+  const yuanValues: number[] = [s.creditPrincipalMinor / 100, s.currentDueMinor / 100, s.currentMinMinor / 100]
+  const dates: string[] = []
+  for (const a of s.accounts) {
+    if (a.principalRemMinor <= 0) continue
+    percents.push(a.realApr)
+    yuanValues.push(a.principalRemMinor / 100, a.dueMinor / 100, a.minPaymentMinor / 100)
+    yuanValues.push(Math.round(a.principalRemMinor * a.dailyRate) / 100) // 每日利息（元）
+    if (a.currentStatement?.dueDate) dates.push(a.currentStatement.dueDate)
+  }
+  for (const x of m.minPaymentDetected) yuanValues.push(x.extraInterestMinor / 100)
+  return { percents, yuanValues, dates }
+}
+
+/**
+ * 渲染层·兜底校验（2.4-4）：把 AI 输出的 HTML 与代码事实块比对。
+ * - 百分比：与事实一致→保留；相近（±0.6）→替换为代码值并标「校正」；无法匹配→标红（未核实）
+ * - 金额：与事实一致→保留；相近（相对差<1%）→替换并标「校正」；其余不动（避免误伤动作按钮固定金额如 ¥500）
+ * - 日期 YYYY-MM-DD：与事实还款日一致→保留；不匹配→标红（未核实）
+ * 返回 { html, corrected }（corrected = 被校正/标注的敏感数字个数）。
+ */
+export function renderDebtGuard(
+  html: string,
+  facts: { percents: number[]; yuanValues: number[]; dates: string[] }
+): { html: string; corrected: number } {
+  let corrected = 0
+  const hasPct = (v: number) => facts.percents.some(f => Math.abs(f - v) < 0.0001)
+  const nearPct = (v: number) => facts.percents.find(f => Math.abs(f - v) <= 0.6)
+  const hasYuan = (v: number) => facts.yuanValues.some(f => Math.abs(f - v) < 0.0001)
+  const nearYuan = (v: number) => facts.yuanValues.find(f => f > 0 && Math.abs(f - v) / Math.max(1, f) < 0.01)
+
+  // 百分比：排除 style/属性里的值（前面是 : 或 =，用负向后行断言）
+  html = html.replace(/(?<![:=])(\d{1,3}(?:\.\d{1,2})?)%/g, (m, raw) => {
+    const v = parseFloat(raw)
+    if (hasPct(v)) return m
+    const near = nearPct(v)
+    if (near !== undefined) {
+      corrected++
+      const fixed = Math.round(near * 10) / 10
+      return `${fixed}%<span title="原输出 ${raw}%，已按代码值校正" style="color:#B45309;font-size:10px;cursor:help;margin-left:2px">校正</span>`
+    }
+    corrected++
+    return `<span title="该百分比未在负债数据中找到出处（未核实）" style="color:#DC2626;font-weight:600">${raw}%</span>`
+  })
+
+  // 金额（¥ 后）：一致保留；相近替换并标「校正」；其余不动
+  html = html.replace(/(?<=¥)([\d,]+(?:\.\d{1,2})?)/g, (m) => {
+    const v = parseFloat(m.replace(/,/g, ''))
+    if (hasYuan(v)) return m
+    const near = nearYuan(v)
+    if (near !== undefined) {
+      corrected++
+      return `${near.toFixed(2)}<span title="原输出 ¥${m}，已按代码值校正" style="color:#B45309;font-size:10px;cursor:help;margin-left:2px">校正</span>`
+    }
+    return m
+  })
+
+  // 日期 YYYY-MM-DD：与事实还款日一致→保留；不匹配→标红（未核实）
+  html = html.replace(/(\d{4})-(\d{2})-(\d{2})/g, (m) => {
+    if (facts.dates.includes(m)) return m
+    corrected++
+    return `<span title="该日期未在负债数据中找到出处（未核实）" style="color:#DC2626;font-weight:600">${m}</span>`
+  })
+
+  return { html, corrected }
+}
+
+/** 网络失败重试一次；仍失败返回 null（调用方走本地降级，绝不输出猜测数据） */
+async function withRetry<T>(fn: () => Promise<T>): Promise<T | null> {
+  try {
+    return await fn()
+  } catch {
+    try {
+      return await fn()
+    } catch {
+      return null
+    }
+  }
+}
+
+/** 债务顾问入口：算法算情境 → AI 组织语言（无 Key / 失败本地降级；AI 输出经渲染层兜底校验） */
 export async function runDebtAdvice(question: string): Promise<{
   html: string
   scenario: DebtScenario
@@ -167,6 +250,8 @@ export async function runDebtAdvice(question: string): Promise<{
   snapshot: DebtSnapshot
   metrics: DebtMetrics
   rich: boolean
+  /** 渲染层校验：被校正/标注的敏感数字个数（>0 表示 AI 输出与代码事实有出入，已被系统兜底） */
+  corrected: number
 }> {
   const snapshot = await buildDebtSnapshot()
   const metrics = computeDebtMetrics(snapshot)
@@ -175,7 +260,7 @@ export async function runDebtAdvice(question: string): Promise<{
   const snapshotText = snapshotToText(snapshot) + '\n' + metricsToText(metrics)
 
   if (!(await hasApiKey())) {
-    return { html: localAdviceHtml(snapshot, metrics, scenario, question), scenario, reasons, snapshot, metrics, rich: false }
+    return { html: localAdviceHtml(snapshot, metrics, scenario, question), scenario, reasons, snapshot, metrics, rich: false, corrected: 0 }
   }
 
   const user =
@@ -184,19 +269,18 @@ export async function runDebtAdvice(question: string): Promise<{
     `当前情境：${SCENARIO_LABEL[scenario]}\n命中依据：${reasons.join('；')}\n\n` +
     `请按系统提示输出精美 HTML 债务顾问回答（结论一句话 + 证据 + 3 个可执行动作，末尾带可点击按钮组）。`
 
-  try {
-    const content = await chatCompletion([
-      { role: 'system', content: CFA_SYSTEM_PROMPT },
-      { role: 'user', content: user },
-    ], { temperature: 0.4 })
-    await incrementAiCount()
-    if (content && content.trim()) {
-      return { html: content.trim(), scenario, reasons, snapshot, metrics, rich: true }
-    }
-    return { html: localAdviceHtml(snapshot, metrics, scenario, question), scenario, reasons, snapshot, metrics, rich: false }
-  } catch {
-    return { html: localAdviceHtml(snapshot, metrics, scenario, question), scenario, reasons, snapshot, metrics, rich: false }
+  const content = await withRetry(() => chatCompletion([
+    { role: 'system', content: CFA_SYSTEM_PROMPT },
+    { role: 'user', content: user },
+  ], { temperature: 0.4 }))
+  await incrementAiCount()
+  if (content && content.trim()) {
+    // 渲染层兜底校验：AI 输出中的关键数字与代码事实块比对，不一致自动校正/标注
+    const guarded = renderDebtGuard(content.trim(), buildDebtFactBlock(snapshot, metrics))
+    return { html: guarded.html, scenario, reasons, snapshot, metrics, rich: true, corrected: guarded.corrected }
   }
+  // 失败（含重试后仍失败）→ 本地代码算好的降级顾问（数字全来自代码，零幻觉）
+  return { html: localAdviceHtml(snapshot, metrics, scenario, question), scenario, reasons, snapshot, metrics, rich: false, corrected: 0 }
 }
 
 // ==================== 债务顾问可执行动作（供页面/对话按钮调用） ====================

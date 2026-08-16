@@ -1,6 +1,5 @@
-import { addTransaction, getAllTransactions } from '../db/crud'
+import type { BatchItem } from './batchImport'
 import type { Transaction } from '../types'
-import { guardTransaction } from './impulseEngine'
 
 // ==================== 类型 ====================
 
@@ -15,12 +14,6 @@ export interface ParsedImportRow {
   /** 原始分类（CSV 里的分类名） */
   rawCategory: string
   status: string | null
-}
-
-export interface ImportResult {
-  imported: number
-  skipped: number
-  rows: ParsedImportRow[]
 }
 
 // ==================== 分类映射（关键词 → 系统 7 分类） ====================
@@ -123,8 +116,10 @@ export function parseCsvText(text: string): ParsedImportRow[] {
     const cells = splitCsvLine(lines[i])
     if (cells.length <= iTime) continue
     const timeStr = cells[iTime].trim()
-    // 第一列必须是日期时间格式
-    if (!/^\d{4}-\d{2}-\d{2}/.test(timeStr)) continue
+    // 时间容错：接受 YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYY年MM月DD日（时间可含时分秒），
+    // 非法格式的行直接跳过（不中断整个文件）
+    const tm = timeStr.match(/^(\d{4})[年\-/.](\d{1,2})[月\-/.](\d{1,2})日?(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
+    if (!tm) continue
 
     const status = iStatus >= 0 && cells[iStatus] ? cells[iStatus].trim() : null
     // 跳过非成功记录
@@ -146,8 +141,9 @@ export function parseCsvText(text: string): ParsedImportRow[] {
     const payRaw = iPay >= 0 && cells[iPay] ? cells[iPay].trim() : ''
     const orderId = iOrder >= 0 && cells[iOrder] ? cells[iOrder].trim().replace(/^["\s]+|["\s]+$/g, '') : ''
 
-    // 本地时间字符串 → ISO（CSV 时间是用户真实消费时间）
-    const iso = new Date(timeStr.replace(' ', 'T')).toISOString()
+    // 本地时间字符串 → ISO（CSV 时间是用户真实消费时间；无时间部分默认当日 00:00）
+    const [, y, mo, d, hh = '0', mi = '0', ss = '0'] = tm
+    const iso = new Date(+y, +mo - 1, +d, +hh, +mi, +ss).toISOString()
 
     rows.push({
       importId: orderId || `${timeStr}-${merchant}-${amountNum}`,
@@ -164,69 +160,74 @@ export function parseCsvText(text: string): ParsedImportRow[] {
   return rows
 }
 
-// ==================== 批量导入 ====================
+// ==================== 批量导入（CSV 并入批量导入：F3） ====================
 
 /**
- * 批量写入数据库：跳过 importId 已存在的记录，每条实时计算冲动分。
- * 返回 { imported, skipped, rows }。
+ * 尝试按 UTF-8 读取；若出现替换符（乱码），回退到 GBK 解码（支付宝/微信导出常见编码）。
  */
-export async function importRows(
-  rows: ParsedImportRow[],
-  onProgress?: (done: number, total: number) => void
-): Promise<ImportResult> {
-  // 已有 importId 集合（去重）
-  const existing = new Set<string>()
-  for (const tx of await getAllTransactions()) {
-    if (tx.importId) existing.add(tx.importId)
-  }
-
-  let imported = 0
-  let skipped = 0
-  const seen = new Set<string>()
-  const doneRows: ParsedImportRow[] = []
-
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i]
-    onProgress?.(i + 1, rows.length)
-    if (r.importId && (existing.has(r.importId) || seen.has(r.importId))) {
-      skipped++
-      continue
-    }
-    if (r.importId) seen.add(r.importId)
-
-    const tx: Omit<Transaction, 'id'> = {
-      amountMinor: r.amountMinor,
-      category: r.category,
-      merchant: r.merchant,
-      time: r.time,
-      txType: r.txType,
-      paymentMethod: r.paymentMethod,
-      source: 'import',
-      impulseScore: 0,
-      impulseLevel: 'low',
-      isRevoked: false,
-      revokedAt: null,
-      regretValue: null,
-      regretAt: null,
-      importId: r.importId,
-      note: '',
-      screenshot: null,
-    }
-
-    // 批量过冲动算法（本地规则引擎，用真实时间）
-    if (r.txType === 'expense') {
+export function readCsvText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error('文件读取失败'))
+    reader.onload = () => {
+      const buf = reader.result as ArrayBuffer
+      const utf8 = new TextDecoder('utf-8', { fatal: false }).decode(buf)
+      if (!utf8.includes('\uFFFD')) {
+        resolve(utf8)
+        return
+      }
       try {
-        const g = await guardTransaction(tx)
-        tx.impulseScore = g.score
-        tx.impulseLevel = g.level
+        resolve(new TextDecoder('gbk').decode(buf))
       } catch {
-        // 冲动算法失败不影响导入
+        resolve(utf8)
       }
     }
+    reader.readAsArrayBuffer(file)
+  })
+}
 
-    await addTransaction(tx)
-    doneRows.push(r)
-    imported++
+let csvUid = 0
+function nextCsvUid(): string {
+  csvUid++
+  return `csv-${Date.now()}-${csvUid}`
+}
+
+export interface CsvBatchResult {
+  items: BatchItem[]
+  /** 文件内按交易单号去重跳过的条数 */
+  skipped: number
+}
+
+/**
+ * 解析支付宝/微信导出的 CSV 账单为批量导入条目（BatchItem）：
+ * - 编码兼容：UTF-8 优先、GBK 回退（readCsvText）
+ * - 列名模糊匹配：包含匹配 + 别名兜底（parseCsvText 内部）
+ * - 时间容错：仅接受标准导出格式的日期列，非法行自动跳过
+ * - 重复检测：文件内按交易单号（importId）去重；保存时的跨库去重由 saveBatchItems 负责
+ */
+export async function parseCsvToBatchItems(file: File): Promise<CsvBatchResult> {
+  const text = await readCsvText(file)
+  const rows = parseCsvText(text)
+  if (rows.length === 0) return { items: [], skipped: 0 }
+
+  const items: BatchItem[] = []
+  const seen = new Set<string>()
+  let skipped = 0
+  for (const r of rows) {
+    if (r.importId && seen.has(r.importId)) { skipped++; continue }
+    if (r.importId) seen.add(r.importId)
+    items.push({
+      uid: nextCsvUid(),
+      amount: r.amountMinor / 100,
+      txType: r.txType,
+      category: r.category,
+      merchant: r.merchant,
+      time: r.time.slice(0, 10),
+      paymentMethod: r.paymentMethod,
+      note: '',
+      checked: true,
+      importId: r.importId || null,
+    })
   }
-  return { imported, skipped, rows: doneRows }
+  return { items, skipped }
 }

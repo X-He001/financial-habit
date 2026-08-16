@@ -198,9 +198,9 @@ export function impulseTemplate(f: Record<string, unknown>): string {
     evidence.push(`- **证据**：${dangerous.count} 笔冲动发生在 ${dangerous.slot} 时段（见时段柱状图）`)
   }
   if (maxImpulse) {
-    evidence.push(`- **证据**：最大单笔冲动 ${maxImpulse.merchant} ${fmtY(maxImpulse.amount)}（冲动指数 ${maxImpulse.score} 分）`)
+    evidence.push(`- **证据**：最大单笔冲动 ${maxImpulse.merchant} ${fmtY(maxImpulse.amount)}（冲动强度 ${impulseScoreLabel(maxImpulse.score)}）`)
   }
-  evidence.push(`- **证据**：平均冲动指数 ${avgScore} 分，强度分布 高${(levelDist?.high ?? 0) + (levelDist?.veryHigh ?? 0)} / 中${levelDist?.medium ?? 0} / 低${levelDist?.low ?? 0}`)
+  evidence.push(`- **证据**：平均冲动强度 ${impulseScoreLabel(avgScore)}，强度分布 高${(levelDist?.high ?? 0) + (levelDist?.veryHigh ?? 0)} / 中${levelDist?.medium ?? 0} / 低${levelDist?.low ?? 0}`)
 
   return `**结论**：本月冲动消费 **${count} 笔**，共 **${fmtY(total)}**。
 ${evidence.join('\n')}
@@ -236,6 +236,14 @@ export function adviceTemplate(f: Record<string, unknown>): string {
 
 function num(v: unknown): number {
   return typeof v === 'number' ? v : Number(v) || 0
+}
+
+/** 冲动分数 → 等级词（前台只展示等级，不展示 0-100 数字） */
+function impulseScoreLabel(score: number): string {
+  if (score <= 30) return '低'
+  if (score <= 50) return '中'
+  if (score <= 70) return '高'
+  return '很高'
 }
 
 function fmtY(n: number): string {

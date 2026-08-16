@@ -5,6 +5,16 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { mkdirSync } from 'node:fs'
 
+// 参与同步的业务表（与 sync.js 的 TABLES 保持一致，用于加 updated_at 迁移列）
+const SYNC_TABLES = [
+  'transactions', 'savings_goals', 'sinking_funds', 'wishlist', 'wishlist_chats',
+  'debts', 'savings_rules', 'notification_logs', 'categories', 'schedules',
+  'settings', 'balance_snapshots', 'commitments', 'moods', 'consumer_events',
+  'decision_records', 'behavior_profiles', 'insights',
+  'credit_accounts', 'credit_statements', 'installments',
+  'knowledge_refs', 'feedback_logs', 'agent_inbox',
+]
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // DATA_DIR 可以是目录（数据库放该目录下的 data.sqlite）或完整文件路径
@@ -165,6 +175,39 @@ export function initSchema() {
       fee_per_minor INTEGER NOT NULL DEFAULT 0, real_apr REAL NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS knowledge_refs (
+      id TEXT PRIMARY KEY, category TEXT NOT NULL DEFAULT '',
+      concept TEXT NOT NULL DEFAULT '', book TEXT NOT NULL DEFAULT '',
+      author TEXT NOT NULL DEFAULT '', thesis TEXT NOT NULL DEFAULT '',
+      applicable_scenarios TEXT NOT NULL DEFAULT '[]',
+      action_templates TEXT NOT NULL DEFAULT '[]',
+      plain_explanation TEXT NOT NULL DEFAULT '', citation TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'active'
+    );
+    CREATE TABLE IF NOT EXISTS feedback_logs (
+      id TEXT PRIMARY KEY, inbox_id TEXT NOT NULL DEFAULT '',
+      type TEXT NOT NULL DEFAULT 'negative', object_type TEXT NOT NULL DEFAULT '',
+      object_id TEXT NOT NULL DEFAULT '', knowledge_ref_id TEXT,
+      hypothesis TEXT NOT NULL DEFAULT '', opening TEXT NOT NULL DEFAULT '',
+      pattern_key TEXT NOT NULL DEFAULT '', before_minor INTEGER NOT NULL DEFAULT 0,
+      after_minor INTEGER, effect_status TEXT, effect_checked_at TEXT,
+      rounds INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS agent_inbox (
+      id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'feedback_card',
+      object_type TEXT NOT NULL DEFAULT '', object_id TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '', opening TEXT NOT NULL DEFAULT '',
+      knowledge_ref_id TEXT, feedback_log_id TEXT,
+      scheduled_at TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+      rounds INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT ''
+    );
   `)
+  // 迁移：为同步表补 updated_at 列（最后写入优先 LWW 用；已有库升级时自动补齐）
+  for (const t of SYNC_TABLES) {
+    const cols = db.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name)
+    if (!cols.includes('updated_at')) {
+      db.exec(`ALTER TABLE ${t} ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`)
+    }
+  }
   console.log('✅ SQLite 数据库表结构已就绪')
 }

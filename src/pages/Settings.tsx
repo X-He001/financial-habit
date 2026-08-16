@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
 import { getSetting, setSetting, initDefaultCategories } from '../db/crud'
+import { addKnowledgeRef, getAllKnowledgeRefs, putKnowledgeRef } from '../db/crud'
 import { db } from '../db/database'
+import type { KnowledgeRef } from '../types'
 import { testModelConnection } from '../api/deepseek'
 import {
   PROVIDERS, getProvider, CUSTOM_PROVIDER_ID, DEFAULT_MODEL,
   getModelConfig, saveModelConfig, clearModelConfig,
+  getRawVisionModelConfig, saveVisionModelConfig, clearVisionModelConfig,
 } from '../api/modelConfig'
 import type { ModelProviderId, ModelConfig } from '../api/modelConfig'
 import { getAiMonthCount } from '../utils/aiUsage'
@@ -16,6 +19,7 @@ import {
   getSyncServerUrl, setSyncServerUrl, testServerConnection, pushSync,
 } from '../sync/pushSync'
 import { pullSync } from '../sync/pullSync'
+import { setAutoSyncEnabled, AUTO_SYNC_KEY } from '../sync/realtimeSync'
 
 // 表名 → 中文（导入统计展示用）
 const TABLE_LABEL: Record<string, string> = {
@@ -56,26 +60,300 @@ function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
   )
 }
 
-export default function Settings() {
-  // AI 模型配置
+/** 掩码显示 API Key：保留后 4 位 */
+function maskKey(k: string) {
+  if (k.length <= 4) return '****'
+  return '••••••••' + k.slice(-4)
+}
+
+/** 知识库条目行（可展开查看详情 + 停用/启用按钮） */
+function KnowledgeRefRow({ ref, onToggle, toggleLabel }: {
+  ref: KnowledgeRef
+  onToggle: () => void
+  toggleLabel: string
+}) {
+  return (
+    <details style={{ background: '#E4E6E6', borderRadius: 10, border: '1px solid #C0C4C4', padding: '9px 12px' }}>
+      <summary style={{ cursor: 'pointer', userSelect: 'none', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: '#111111' }}>{ref.concept}</span>
+        <span style={{ fontSize: 11.5, color: '#888888' }}>
+          {ref.category} · {ref.book || '自定义'} {ref.author ? '· ' + ref.author : ''}
+        </span>
+        <button
+          onClick={(e) => { e.preventDefault(); onToggle() }}
+          style={{
+            marginLeft: 'auto', padding: '5px 12px', borderRadius: 8, border: '1px solid #C0C4C4', background: '#D8DADA',
+            color: '#0040FF', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font-stack)', flexShrink: 0,
+          }}>
+          {toggleLabel}
+        </button>
+      </summary>
+      <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #C0C4C4', fontSize: 12, color: '#666666', lineHeight: 1.8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div><b>论点：</b>{ref.thesis}</div>
+        {ref.plain_explanation && <div><b>科普：</b>{ref.plain_explanation}</div>}
+        {ref.applicable_scenarios.length > 0 && (
+          <div><b>适用场景：</b>{ref.applicable_scenarios.join(' / ')}</div>
+        )}
+        {ref.action_templates.length > 0 && (
+          <div><b>动作建议：</b>{ref.action_templates.join(' / ')}</div>
+        )}
+        {ref.citation && <div><b>出处：</b>{ref.citation}</div>}
+      </div>
+    </details>
+  )
+}
+
+/** 单张模型配置卡片（主模型 / 识图模型共用，双模型分流由 purpose 决定） */
+function ModelConfigCard({
+  title, icon, description, purpose, onToast,
+}: {
+  title: string
+  icon: string
+  description: string
+  purpose: 'main' | 'vision'
+  onToast: (msg: string) => void
+}) {
+  const isVision = purpose === 'vision'
   const [provider, setProvider] = useState<ModelProviderId>('deepseek')
   const [modelName, setModelName] = useState(DEFAULT_MODEL)
   const [apiUrl, setApiUrl] = useState('https://api.deepseek.com')
   const [apiKey, setApiKey] = useState('')
   const [showApiKey, setShowApiKey] = useState(false)
-  const [modelConfigured, setModelConfigured] = useState(false)
+  const [configured, setConfigured] = useState(false)
   const [testBusy, setTestBusy] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
+
+  useEffect(() => { void load() }, [purpose])
+
+  /** 加载当前配置（识图卡读独立配置，不回退主模型） */
+  async function load() {
+    const cfg = isVision ? await getRawVisionModelConfig() : await getModelConfig()
+    if (cfg) {
+      setProvider(cfg.provider)
+      setModelName(cfg.modelName)
+      setApiUrl(cfg.apiUrl)
+      setApiKey(cfg.apiKey)
+      setConfigured(true)
+    } else {
+      const p = PROVIDERS[0]
+      setProvider(p.id)
+      setModelName(p.models[0])
+      setApiUrl(p.apiUrl)
+      setConfigured(false)
+    }
+    setTestResult(null)
+  }
+
+  /** 选择厂商：自动加载该厂商第一个模型并填充 API Base URL（自定义模式保留手动输入） */
+  function handleProviderChange(id: ModelProviderId) {
+    setProvider(id)
+    setTestResult(null)
+    if (id === CUSTOM_PROVIDER_ID) return
+    const p = getProvider(id)
+    if (p && p.models.length > 0) {
+      setModelName(p.models[0])
+      setApiUrl(p.apiUrl)
+    }
+  }
+
+  /** 选择模型：自动填充 API Base URL（按厂商表） */
+  function handleModelChange(m: string) {
+    setModelName(m)
+    setTestResult(null)
+    const p = getProvider(provider)
+    if (p && p.id !== CUSTOM_PROVIDER_ID) setApiUrl(p.apiUrl)
+  }
+
+  async function handleSave() {
+    const p = provider
+    const m = modelName.trim()
+    const u = apiUrl.trim()
+    const k = apiKey.trim()
+    if (p === CUSTOM_PROVIDER_ID) {
+      if (!u) { onToast('请填写 API Base URL'); return }
+      if (!m) { onToast('请填写模型 ID'); return }
+    }
+    if (!k) { onToast('请填写 API Key'); return }
+    const cfg: ModelConfig = { provider: p, modelName: m, apiUrl: u, apiKey: k }
+    if (isVision) await saveVisionModelConfig(cfg)
+    else await saveModelConfig(cfg)
+    setConfigured(true)
+    onToast('✅ 配置已保存，立即生效')
+  }
+
+  /** 测试连接：用当前表单里的配置（未保存也测）调用 /chat/completions */
+  async function handleTest() {
+    if (testBusy) return
+    if (!apiKey.trim()) { onToast('请先填写 API Key'); return }
+    setTestBusy(true)
+    setTestResult(null)
+    const r = await testModelConnection({
+      provider, modelName: modelName.trim(), apiUrl: apiUrl.trim(), apiKey: apiKey.trim(),
+    })
+    setTestResult(r)
+    setTestBusy(false)
+    onToast(r.ok ? '✅ 连接成功' : '❌ 连接失败')
+  }
+
+  async function handleClear() {
+    if (isVision) await clearVisionModelConfig()
+    else await clearModelConfig()
+    setApiKey('')
+    setConfigured(false)
+    setTestResult(null)
+    onToast('已清除该模型配置')
+  }
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #C0C4C4',
+    fontSize: 14, color: 'var(--color-text)', outline: 'none', fontFamily: 'var(--font-stack)',
+    boxSizing: 'border-box', background: '#E8EAEA',
+  }
+  const selectStyle: React.CSSProperties = { ...inputStyle }
+
+  return (
+    <div className="card" style={{ padding: 24 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-text)' }}>{icon} {title}</span>
+        <span style={{
+          fontSize: 12, padding: '3px 10px', borderRadius: 20, fontWeight: 600,
+          background: configured ? 'rgba(34,211,238,0.08)' : '#E4E6E6',
+          color: configured ? '#22D3EE' : '#888888',
+        }}>
+          {configured
+            ? `已配置 · ${modelName}${apiKey ? ` · 尾号 ${maskKey(apiKey)}` : ''}`
+            : isVision ? '未配置 · 截图识别将使用主模型' : '未配置'}
+        </span>
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 16, lineHeight: 1.7 }}>
+        {description}
+      </div>
+
+      {/* 厂商（一级下拉） */}
+      <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>模型厂商</div>
+      <select
+        value={provider}
+        onChange={(e) => handleProviderChange(e.target.value as ModelProviderId)}
+        style={{ ...selectStyle, marginBottom: 14 }}
+      >
+        {PROVIDERS.map(p => (
+          <option key={p.id} value={p.id}>
+            {p.label}{p.note ? `（${p.note}）` : ''}
+          </option>
+        ))}
+      </select>
+
+      {/* 模型（二级下拉，联动加载；自定义模式为手动输入） */}
+      <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>
+        {provider === CUSTOM_PROVIDER_ID ? '模型 ID' : '具体模型'}
+      </div>
+      {provider === CUSTOM_PROVIDER_ID ? (
+        <input
+          value={modelName}
+          onChange={(e) => { setModelName(e.target.value); setTestResult(null) }}
+          placeholder="如 my-custom-model"
+          style={{ ...inputStyle, marginBottom: 14 }}
+        />
+      ) : (
+        <select
+          value={modelName}
+          onChange={(e) => handleModelChange(e.target.value)}
+          style={{ ...selectStyle, marginBottom: 14 }}
+        >
+          {(getProvider(provider)?.models ?? []).map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
+      )}
+
+      {/* API Base URL（预设自动填充，可手动改；自定义必须手填） */}
+      <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>API Base URL</div>
+      <input
+        value={apiUrl}
+        onChange={(e) => { setApiUrl(e.target.value); setTestResult(null) }}
+        placeholder="https://api.example.com/v1"
+        style={{ ...inputStyle, marginBottom: 14 }}
+      />
+
+      {/* API Key */}
+      <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>API Key</div>
+      <div style={{ position: 'relative', marginBottom: 14 }}>
+        <input
+          type={showApiKey ? 'text' : 'password'}
+          value={apiKey}
+          onChange={(e) => { setApiKey(e.target.value); setTestResult(null) }}
+          placeholder="sk-..."
+          style={inputStyle}
+        />
+        <button
+          onClick={() => setShowApiKey(v => !v)}
+          title={showApiKey ? '隐藏' : '显示'}
+          style={{
+            position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
+            background: 'none', border: 'none', color: '#888888', fontSize: 14, cursor: 'pointer',
+          }}>
+          {showApiKey ? '🙈' : '👁'}
+        </button>
+      </div>
+
+      {/* 测试连接结果 */}
+      {testResult && (
+        <div style={{
+          padding: '9px 12px', borderRadius: 10, marginBottom: 14, fontSize: 12.5, lineHeight: 1.6,
+          background: testResult.ok ? 'rgba(34,197,94,0.08)' : '#FEF2F2',
+          color: testResult.ok ? '#16A34A' : '#D73333', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+        }}>
+          {testResult.ok ? '✅ 连接成功' : '❌ ' + testResult.message}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 10 }}>
+        <button
+          onClick={() => void handleTest()}
+          disabled={testBusy}
+          style={{
+            padding: '9px 18px', borderRadius: 10, border: '1px solid #C0C4C4', background: '#D8DADA',
+            fontSize: 14, cursor: testBusy ? 'not-allowed' : 'pointer', fontFamily: 'var(--font-stack)',
+            opacity: testBusy ? 0.6 : 1,
+          }}>
+          {testBusy ? '测试中…' : '🔄 测试连接'}
+        </button>
+        <button onClick={() => void handleSave()} className="btn-primary" style={{ padding: '9px 24px' }}>保存</button>
+        {configured && (
+          <button onClick={() => void handleClear()}
+            style={{
+              padding: '9px 18px', borderRadius: 10, fontSize: 14, cursor: 'pointer',
+              background: '#D8DADA', border: '1px solid #C0C4C4', color: '#888888', fontFamily: 'var(--font-stack)',
+            }}>
+            清除
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export default function Settings() {
   const [toast, setToast] = useState<string | null>(null)
   const [aiCount, setAiCount] = useState(0)
   // 防护设置
   const [nightLock, setNightLock] = useState(false)
   const [fragileReminder, setFragileReminder] = useState(true)
-  const [feedbackReminder, setFeedbackReminder] = useState(true)
+  const [feedbackCard, setFeedbackCard] = useState(true)
   const [platformLimit, setPlatformLimit] = useState<{ platform: string; amountMinor: number }[]>([])
   const [platformSel, setPlatformSel] = useState(PLATFORM_OPTIONS[0])
   const [platformAmt, setPlatformAmt] = useState('')
   const [editingPlatform, setEditingPlatform] = useState<string | null>(null)
+  // 知识库管理（F5 盲区6：查看 pending / 补充 / 停用 active）
+  const [knowledgeRefs, setKnowledgeRefs] = useState<KnowledgeRef[]>([])
+  const [showKnowledgeForm, setShowKnowledgeForm] = useState(false)
+  const [kfConcept, setKfConcept] = useState('')
+  const [kfCategory, setKfCategory] = useState('')
+  const [kfThesis, setKfThesis] = useState('')
+  const [kfPlain, setKfPlain] = useState('')
+  const [kfBook, setKfBook] = useState('')
+  const [kfAuthor, setKfAuthor] = useState('')
+  const [kfCitation, setKfCitation] = useState('')
+  const [kfScenarios, setKfScenarios] = useState('')
+  const [kfTemplates, setKfTemplates] = useState('')
   // 桌宠 / 备份
   const [petBusy, setPetBusy] = useState(false)
   const [backupBusy, setBackupBusy] = useState(false)
@@ -83,6 +361,7 @@ export default function Settings() {
   const importInputRef = useRef<HTMLInputElement>(null)
   // 数据同步
   const [syncUrl, setSyncUrl] = useState('')
+  const [autoSync, setAutoSync] = useState(true)
   const [syncStatus, setSyncStatus] = useState<{ ok: boolean; message: string } | null>(null)
   const [syncBusy, setSyncBusy] = useState(false)
   const [syncResult, setSyncResult] = useState<string | null>(null)
@@ -115,27 +394,13 @@ export default function Settings() {
   }
 
   async function load() {
-    // AI 模型配置（兼容旧版 deepseekApiKey 自动迁移）
-    const cfg = await getModelConfig()
-    if (cfg) {
-      setProvider(cfg.provider)
-      setModelName(cfg.modelName)
-      setApiUrl(cfg.apiUrl)
-      setApiKey(cfg.apiKey)
-      setModelConfigured(true)
-    } else {
-      const p = PROVIDERS[0]
-      setProvider(p.id)
-      setModelName(p.models[0])
-      setApiUrl(p.apiUrl)
-    }
     setAiCount(await getAiMonthCount())
-    const [nl, fr, pl, frEnabled] = await Promise.all([
-      getSetting('nightLock'), getSetting('fragileReminder'), getSetting('platformLimit'), getSetting('feedbackReminderEnabled'),
+    const [nl, fr, pl, fc] = await Promise.all([
+      getSetting('nightLock'), getSetting('fragileReminder'), getSetting('platformLimit'), getSetting('feedbackCardEnabled'),
     ])
     setNightLock(nl === 'true')
     setFragileReminder(fr !== 'false')
-    setFeedbackReminder(frEnabled !== 'false')
+    setFeedbackCard(fc !== 'false')
     // 平台限额：数组（多平台），兼容旧版单对象 {platform, amountMinor}
     if (typeof pl === 'string') {
       try {
@@ -149,85 +414,8 @@ export default function Settings() {
       } catch { /* ignore */ }
     }
     setSyncUrl(await getSyncServerUrl())
-  }
-
-  // ==================== AI 模型配置 ====================
-
-  /** 选择厂商：自动加载该厂商第一个模型并填充 API Base URL（自定义模式保留手动输入） */
-  function handleProviderChange(id: ModelProviderId) {
-    setProvider(id)
-    setTestResult(null)
-    if (id === CUSTOM_PROVIDER_ID) return
-    const p = getProvider(id)
-    if (p && p.models.length > 0) {
-      setModelName(p.models[0])
-      setApiUrl(p.apiUrl)
-    }
-  }
-
-  /** 选择模型：自动填充 API Base URL（按厂商表） */
-  function handleModelChange(m: string) {
-    setModelName(m)
-    setTestResult(null)
-    const p = getProvider(provider)
-    if (p && p.id !== CUSTOM_PROVIDER_ID) setApiUrl(p.apiUrl)
-  }
-
-  async function handleSaveModel() {
-    const p = provider
-    const m = modelName.trim()
-    const u = apiUrl.trim()
-    const k = apiKey.trim()
-    if (p === CUSTOM_PROVIDER_ID) {
-      if (!u) {
-        setToast('请填写 API Base URL')
-        setTimeout(() => setToast(null), 2000)
-        return
-      }
-      if (!m) {
-        setToast('请填写模型 ID')
-        setTimeout(() => setToast(null), 2000)
-        return
-      }
-    }
-    if (!k) {
-      setToast('请填写 API Key')
-      setTimeout(() => setToast(null), 2000)
-      return
-    }
-    const cfg: ModelConfig = { provider: p, modelName: m, apiUrl: u, apiKey: k }
-    await saveModelConfig(cfg)
-    setModelConfigured(true)
-    setToast('✅ 配置已保存，立即生效')
-    setTimeout(() => setToast(null), 2500)
-  }
-
-  /** 测试连接：用当前表单里的配置（未保存也测）调用 /chat/completions */
-  async function handleTestModel() {
-    if (testBusy) return
-    if (!apiKey.trim()) {
-      setToast('请先填写 API Key')
-      setTimeout(() => setToast(null), 2000)
-      return
-    }
-    setTestBusy(true)
-    setTestResult(null)
-    const r = await testModelConnection({
-      provider, modelName: modelName.trim(), apiUrl: apiUrl.trim(), apiKey: apiKey.trim(),
-    })
-    setTestResult(r)
-    setTestBusy(false)
-    setToast(r.ok ? '✅ 连接成功' : '❌ 连接失败')
-    setTimeout(() => setToast(null), 2500)
-  }
-
-  async function handleClearModel() {
-    await clearModelConfig()
-    setApiKey('')
-    setModelConfigured(false)
-    setTestResult(null)
-    setToast('已清除 AI 模型配置')
-    setTimeout(() => setToast(null), 2000)
+    setAutoSync(await getSetting(AUTO_SYNC_KEY) !== 'false')
+    setKnowledgeRefs(await getAllKnowledgeRefs())
   }
 
   // ==================== 平台每日限额 ====================
@@ -281,6 +469,50 @@ export default function Settings() {
     if (editingPlatform === p) { setEditingPlatform(null); setPlatformAmt('') }
     setToast(`已解除${p}的每日限额`)
     setTimeout(() => setToast(null), 2000)
+  }
+
+  // ==================== 知识库管理（F5 盲区6） ====================
+
+  /** 停用/启用知识条目：active ↔ pending（pending 不被 AI 检索引用） */
+  async function handleKnowledgeStatus(id: string, status: 'active' | 'pending') {
+    const ref = knowledgeRefs.find(r => r.id === id)
+    if (!ref) return
+    await putKnowledgeRef({ ...ref, status, updatedAt: new Date().toISOString() })
+    setKnowledgeRefs(await getAllKnowledgeRefs())
+    setToast(status === 'active' ? '✅ 已启用该知识条目（AI 可引用）' : '已停用该知识条目（AI 不再引用）')
+    setTimeout(() => setToast(null), 2200)
+  }
+
+  /** 补充新知识（默认进入 pending，可在下方列表确认后启用） */
+  async function handleAddKnowledge() {
+    if (!kfConcept.trim() || !kfThesis.trim()) {
+      setToast('请至少填写「概念名」和「核心论点」')
+      setTimeout(() => setToast(null), 2200)
+      return
+    }
+    const scenarios = kfScenarios.split(/[,，、;；\n]/).map(s => s.trim()).filter(Boolean)
+    const templates = kfTemplates.split(/[,，、;；\n]/).map(s => s.trim()).filter(Boolean)
+    const book = kfBook.trim()
+    const author = kfAuthor.trim()
+    await addKnowledgeRef({
+      category: kfCategory.trim() || '自定义',
+      concept: kfConcept.trim(),
+      book,
+      author,
+      thesis: kfThesis.trim(),
+      applicable_scenarios: scenarios,
+      action_templates: templates,
+      plain_explanation: kfPlain.trim(),
+      citation: kfCitation.trim() || `${book || '自定义'}${author ? ' ' + author : ''}`.trim(),
+      status: 'pending',
+      updatedAt: new Date().toISOString(),
+    })
+    setKfConcept(''); setKfCategory(''); setKfThesis(''); setKfPlain('')
+    setKfBook(''); setKfAuthor(''); setKfCitation(''); setKfScenarios(''); setKfTemplates('')
+    setShowKnowledgeForm(false)
+    setKnowledgeRefs(await getAllKnowledgeRefs())
+    setToast('✅ 已加入知识库（待审，可在下方「启用」后生效）')
+    setTimeout(() => setToast(null), 2600)
   }
 
   // ==================== 桌宠数据 ====================
@@ -400,6 +632,15 @@ export default function Settings() {
 
   // ==================== 数据同步（本地 → 云端） ====================
 
+  /** 切换自动同步：先写设置（确保本次变更进入推送队列），再更新内存开关 */
+  async function handleAutoSyncToggle(on: boolean) {
+    setAutoSync(on)
+    await setSetting(AUTO_SYNC_KEY, on ? 'true' : 'false')
+    setAutoSyncEnabled(on)
+    setToast(on ? '✅ 已开启自动同步' : '已关闭自动同步，仅保留手动推送/拉取')
+    setTimeout(() => setToast(null), 2000)
+  }
+
   /** 保存云端地址 + 测连接 */
   async function handleSyncConnect() {
     const url = syncUrl.trim()
@@ -495,18 +736,7 @@ export default function Settings() {
     }
   }
 
-  const maskKey = (k: string) => {
-    if (k.length <= 4) return '****'
-    return '••••••••' + k.slice(-4)
-  }
-
   const inputStyle: React.CSSProperties = {
-    width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #C0C4C4',
-    fontSize: 14, color: 'var(--color-text)', outline: 'none', fontFamily: 'var(--font-stack)',
-    boxSizing: 'border-box', background: '#E8EAEA',
-  }
-
-  const selectStyle: React.CSSProperties = {
     width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #C0C4C4',
     fontSize: 14, color: 'var(--color-text)', outline: 'none', fontFamily: 'var(--font-stack)',
     boxSizing: 'border-box', background: '#E8EAEA',
@@ -536,124 +766,21 @@ export default function Settings() {
       }}>
         {/* ========== 左栏：主要设置 ========== */}
         <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 24 }}>
-          {/* AI 模型配置 */}
-          <div className="card" style={{ padding: 24 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-text)' }}>🤖 AI 模型配置</span>
-              <span style={{
-                fontSize: 12, padding: '3px 10px', borderRadius: 20, fontWeight: 600,
-                background: modelConfigured ? 'rgba(34,211,238,0.08)' : '#E4E6E6',
-                color: modelConfigured ? '#22D3EE' : '#888888',
-              }}>
-                {modelConfigured
-                  ? `已配置 · ${modelName}${apiKey ? ` · 尾号 ${maskKey(apiKey)}` : ''}`
-                  : '未配置'}
-              </span>
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 16, lineHeight: 1.7 }}>
-              AI 对话、AI 报告、截图识别、批量导入账单都会使用这里选择的模型（OpenAI 兼容格式）。
-              Key 保存在浏览器本地，也会随数据同步上传到你自己的服务器，供后端代理调用。
-            </div>
-
-            {/* 厂商（一级下拉） */}
-            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>模型厂商</div>
-            <select
-              value={provider}
-              onChange={(e) => handleProviderChange(e.target.value as ModelProviderId)}
-              style={{ ...selectStyle, marginBottom: 14 }}
-            >
-              {PROVIDERS.map(p => (
-                <option key={p.id} value={p.id}>
-                  {p.label}{p.note ? `（${p.note}）` : ''}
-                </option>
-              ))}
-            </select>
-
-            {/* 模型（二级下拉，联动加载；自定义模式为手动输入） */}
-            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>
-              {provider === CUSTOM_PROVIDER_ID ? '模型 ID' : '具体模型'}
-            </div>
-            {provider === CUSTOM_PROVIDER_ID ? (
-              <input
-                value={modelName}
-                onChange={(e) => { setModelName(e.target.value); setTestResult(null) }}
-                placeholder="如 my-custom-model"
-                style={{ ...inputStyle, marginBottom: 14 }}
-              />
-            ) : (
-              <select
-                value={modelName}
-                onChange={(e) => handleModelChange(e.target.value)}
-                style={{ ...selectStyle, marginBottom: 14 }}
-              >
-                {(getProvider(provider)?.models ?? []).map(m => <option key={m} value={m}>{m}</option>)}
-              </select>
-            )}
-
-            {/* API Base URL（预设自动填充，可手动改；自定义必须手填） */}
-            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>API Base URL</div>
-            <input
-              value={apiUrl}
-              onChange={(e) => { setApiUrl(e.target.value); setTestResult(null) }}
-              placeholder="https://api.example.com/v1"
-              style={{ ...inputStyle, marginBottom: 14 }}
-            />
-
-            {/* API Key */}
-            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>API Key</div>
-            <div style={{ position: 'relative', marginBottom: 14 }}>
-              <input
-                type={showApiKey ? 'text' : 'password'}
-                value={apiKey}
-                onChange={(e) => { setApiKey(e.target.value); setTestResult(null) }}
-                placeholder="sk-..."
-                style={inputStyle}
-              />
-              <button
-                onClick={() => setShowApiKey(v => !v)}
-                title={showApiKey ? '隐藏' : '显示'}
-                style={{
-                  position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
-                  background: 'none', border: 'none', color: '#888888', fontSize: 14, cursor: 'pointer',
-                }}>
-                {showApiKey ? '🙈' : '👁'}
-              </button>
-            </div>
-
-            {/* 测试连接结果 */}
-            {testResult && (
-              <div style={{
-                padding: '9px 12px', borderRadius: 10, marginBottom: 14, fontSize: 12.5, lineHeight: 1.6,
-                background: testResult.ok ? 'rgba(34,197,94,0.08)' : '#FEF2F2',
-                color: testResult.ok ? '#16A34A' : '#D73333', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-              }}>
-                {testResult.ok ? '✅ 连接成功' : '❌ ' + testResult.message}
-              </div>
-            )}
-
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button
-                onClick={() => void handleTestModel()}
-                disabled={testBusy}
-                style={{
-                  padding: '9px 18px', borderRadius: 10, border: '1px solid #C0C4C4', background: '#D8DADA',
-                  fontSize: 14, cursor: testBusy ? 'not-allowed' : 'pointer', fontFamily: 'var(--font-stack)',
-                  opacity: testBusy ? 0.6 : 1,
-                }}>
-                {testBusy ? '测试中…' : '🔄 测试连接'}
-              </button>
-              <button onClick={() => void handleSaveModel()} className="btn-primary" style={{ padding: '9px 24px' }}>保存</button>
-              {modelConfigured && (
-                <button onClick={() => void handleClearModel()}
-                  style={{
-                    padding: '9px 18px', borderRadius: 10, fontSize: 14, cursor: 'pointer',
-                    background: '#D8DADA', border: '1px solid #C0C4C4', color: '#888888', fontFamily: 'var(--font-stack)',
-                  }}>
-                  清除
-                </button>
-              )}
-            </div>
-          </div>
+          {/* 双模型配置：主模型 + 识图模型（各自独立保存/测试） */}
+          <ModelConfigCard
+            purpose="main"
+            icon="🤖"
+            title="AI 对话与分析模型"
+            description="AI 对话、AI 报告、批量导入账单解析、算法分析等纯文本任务使用主模型（OpenAI 兼容格式）。Key 保存在浏览器本地，也会随数据同步上传到你自己的服务器，供后端代理调用。"
+            onToast={(msg) => { setToast(msg); setTimeout(() => setToast(null), 2500) }}
+          />
+          <ModelConfigCard
+            purpose="vision"
+            icon="📷"
+            title="识图模型（截图识别用）"
+            description="截图识别、图片记账等带图片的请求使用识图模型。建议选择支持视觉输入的模型（如 qwen3-vl-plus / GLM-4V-Plus）。未配置时截图识别自动使用主模型。"
+            onToast={(msg) => { setToast(msg); setTimeout(() => setToast(null), 2500) }}
+          />
 
           {/* 防护设置 */}
           <div className="card" style={{ padding: 20 }}>
@@ -678,13 +805,13 @@ export default function Settings() {
               <Toggle on={fragileReminder} onClick={() => { setFragileReminder(v => !v); void setSetting('fragileReminder', fragileReminder ? 'false' : 'true') }} />
             </div>
 
-            {/* 购买反馈提醒（30 天购买反馈） */}
+            {/* 购买反馈（F4 重定义：旧的 30 天购买反馈开关 → AI 购买反馈卡总开关） */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid #C0C4C4' }}>
               <div>
-                <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--color-text)' }}>🕐 购买反馈提醒</div>
-                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 2 }}>买满 30 天时，首页顶部提醒你"用上了吗"</div>
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--color-text)' }}>🛎️ AI 购买反馈卡</div>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 2 }}>基于消费画像自动生成购买反馈（犹豫后购买 / 冲动陷阱 / 进步表扬），次日 9 点首页展示，每周最多 3 条</div>
               </div>
-              <Toggle on={feedbackReminder} onClick={() => { setFeedbackReminder(v => !v); void setSetting('feedbackReminderEnabled', feedbackReminder ? 'false' : 'true') }} />
+              <Toggle on={feedbackCard} onClick={() => { setFeedbackCard(v => !v); void setSetting('feedbackCardEnabled', feedbackCard ? 'false' : 'true') }} />
             </div>
 
             {/* 平台限额管理（手动输入） */}
@@ -758,6 +885,88 @@ export default function Settings() {
                   </button>
                 )}
               </div>
+            </div>
+          </div>
+
+          {/* 知识库管理（F5 盲区6：查看 pending / 补充 / 停用 active） */}
+          <div className="card" style={{ padding: 20 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, flexWrap: 'wrap' }}>
+              <div>
+                <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-text)', marginBottom: 4 }}>📚 知识库管理</div>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
+                  AI 反馈卡引用的"书"库（《意志力陷阱》《Unwinding Anxiety》等）。已启用 = AI 可检索引用；待审 = 暂不引用。
+                </div>
+              </div>
+              <button onClick={() => setShowKnowledgeForm(v => !v)}
+                className="btn-primary" style={{ padding: '8px 16px', fontSize: 12.5, flexShrink: 0 }}>
+                {showKnowledgeForm ? '✕ 收起' : '＋ 补充知识'}
+              </button>
+            </div>
+
+            {/* 补充表单 */}
+            {showKnowledgeForm && (
+              <div style={{ marginTop: 14, padding: 14, background: '#E4E6E6', borderRadius: 12, border: '1px solid #C0C4C4', display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                  <input value={kfConcept} onChange={e => setKfConcept(e.target.value)} placeholder="概念名（必填，如：损失厌恶）"
+                    style={{ ...inputStyle, flex: 1, minWidth: 160 }} />
+                  <input value={kfCategory} onChange={e => setKfCategory(e.target.value)} placeholder="类别（如：决策偏差）"
+                    style={{ ...inputStyle, flex: 1, minWidth: 140 }} />
+                </div>
+                <textarea value={kfThesis} onChange={e => setKfThesis(e.target.value)} placeholder="核心论点（必填）：用一句话说明这个知识在说什么"
+                  style={{ ...inputStyle, minHeight: 54, resize: 'vertical', lineHeight: 1.6 }} />
+                <textarea value={kfPlain} onChange={e => setKfPlain(e.target.value)} placeholder="人话科普文案（AI 据此给用户解释）"
+                  style={{ ...inputStyle, minHeight: 54, resize: 'vertical', lineHeight: 1.6 }} />
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                  <input value={kfBook} onChange={e => setKfBook(e.target.value)} placeholder="书名（如：《思考，快与慢》）"
+                    style={{ ...inputStyle, flex: 1, minWidth: 150 }} />
+                  <input value={kfAuthor} onChange={e => setKfAuthor(e.target.value)} placeholder="作者"
+                    style={{ ...inputStyle, flex: 1, minWidth: 130 }} />
+                </div>
+                <input value={kfCitation} onChange={e => setKfCitation(e.target.value)} placeholder="出处（只显示在「了解更多」折叠区，如：《思考，快与慢》Kahneman）"
+                  style={inputStyle} />
+                <input value={kfScenarios} onChange={e => setKfScenarios(e.target.value)} placeholder="适用场景（逗号分隔，如：损失厌恶,买了就后悔,不愿止损）"
+                  style={inputStyle} />
+                <input value={kfTemplates} onChange={e => setKfTemplates(e.target.value)} placeholder="动作建议（逗号分隔，如：下单前先问'不买会损失什么'）"
+                  style={inputStyle} />
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                  <button onClick={() => setShowKnowledgeForm(false)}
+                    style={{
+                      padding: '8px 16px', borderRadius: 10, border: '1px solid #C0C4C4', background: '#D8DADA',
+                      color: '#888888', fontSize: 12.5, cursor: 'pointer', fontFamily: 'var(--font-stack)',
+                    }}>
+                    取消
+                  </button>
+                  <button onClick={() => void handleAddKnowledge()} className="btn-primary" style={{ padding: '8px 18px', fontSize: 12.5 }}>
+                    加入知识库
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* 已启用 */}
+            <div style={{ marginTop: 16, fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)' }}>
+              已启用（{knowledgeRefs.filter(r => r.status === 'active').length}）
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+              {knowledgeRefs.filter(r => r.status === 'active').map(ref => (
+                <KnowledgeRefRow key={ref.id} ref={ref} onToggle={() => void handleKnowledgeStatus(ref.id, 'pending')} toggleLabel="停用" />
+              ))}
+              {knowledgeRefs.filter(r => r.status === 'active').length === 0 && (
+                <div style={{ fontSize: 12, color: '#888888', padding: '6px 0' }}>暂无已启用的知识条目</div>
+              )}
+            </div>
+
+            {/* 待审 / 已停用 */}
+            <div style={{ marginTop: 16, fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)' }}>
+              待审 / 已停用（{knowledgeRefs.filter(r => r.status === 'pending').length}）
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+              {knowledgeRefs.filter(r => r.status === 'pending').map(ref => (
+                <KnowledgeRefRow key={ref.id} ref={ref} onToggle={() => void handleKnowledgeStatus(ref.id, 'active')} toggleLabel="启用" />
+              ))}
+              {knowledgeRefs.filter(r => r.status === 'pending').length === 0 && (
+                <div style={{ fontSize: 12, color: '#888888', padding: '6px 0' }}>暂无待审条目</div>
+              )}
             </div>
           </div>
 
@@ -841,7 +1050,18 @@ export default function Settings() {
           <div className="card" style={{ padding: 20 }}>
             <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-text)', marginBottom: 4 }}>☁️ 数据同步</div>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 16, lineHeight: 1.7 }}>
-              把本地数据推送到你的服务器（云端）。推送后可跨设备访问同一份数据。
+              本地数据自动与你的服务器（云端）保持同步，手机 / 电脑 / 桌宠多端共用同一份数据。
+            </div>
+
+            {/* 自动同步开关 */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid #C0C4C4', marginBottom: 14 }}>
+              <div>
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--color-text)' }}>🔄 自动同步</div>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 2 }}>
+                  数据变更后自动推送；启动 / 回到前台 / 每 30 秒自动拉取合并
+                </div>
+              </div>
+              <Toggle on={autoSync} onClick={() => void handleAutoSyncToggle(!autoSync)} />
             </div>
 
             {/* 云端地址 */}
@@ -899,9 +1119,10 @@ export default function Settings() {
             )}
 
             <div style={{ fontSize: 11, color: '#888888', lineHeight: 1.8 }}>
-              推送的数据：交易、储蓄目标、债务、日程、设置（共 5 张核心表）。
-              全量推送会检查每条记录在云端是否存在，自动选择新增或更新。<br />
-              「从云端拉取」会用云端数据覆盖本地全部业务表（21 张，含设置），操作前请先推送以备份本地数据。
+              自动同步开启时：本地增删改（交易/负债/欲望清单/设置等 21 张表）约 2.5 秒后自动推送云端；
+              本端启动、回到前台、收到变更通知或每 30 秒会自动从云端拉取合并（按 updatedAt 最后写入优先，本地为最新时保留本地）。
+              关闭自动同步后仅保留下方手动按钮。<br />
+              「推送本地数据到云端」全量推送本地 21 张表；「从云端拉取」会用云端数据覆盖本地全部业务表，操作前请先推送以备份本地数据。
             </div>
           </div>
         </div>

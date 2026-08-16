@@ -164,12 +164,14 @@ export default function NetWorth() {
     }
     await addBalanceSnapshot(s)
     setShowForm(false)
+    window.dispatchEvent(new CustomEvent('dashboard-refresh'))
     await load()
   }
 
   async function handleDelete(id: string) {
     if (!window.confirm('删除这条快照？')) return
     await deleteBalanceSnapshot(id)
+    window.dispatchEvent(new CustomEvent('dashboard-refresh'))
     await load()
   }
 

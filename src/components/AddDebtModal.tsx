@@ -4,13 +4,6 @@ import type { CreditPlatform } from '../types'
 
 const PLATFORMS: CreditPlatform[] = ['花呗', '京东白条', '抖音月付', '拼多多先用后付', '信用卡', '其他']
 
-function todayStr(offsetDays = 0): string {
-  const d = new Date()
-  d.setDate(d.getDate() + offsetDays)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
-}
-
 export interface AddDebtModalProps {
   open: boolean
   onClose: () => void
@@ -22,8 +15,10 @@ export default function AddDebtModal({ open, onClose, onSaved }: AddDebtModalPro
   const [amountText, setAmountText] = useState('')
   const [use, setUse] = useState('')
   const [feeText, setFeeText] = useState('')
-  const [nextDueDate, setNextDueDate] = useState(todayStr(30))
+  // 不预填任何默认值：还款日 / 月还款 / 还款月数都由用户手动填写
+  const [nextDueDate, setNextDueDate] = useState('')
   const [monthlyText, setMonthlyText] = useState('')
+  const [monthsText, setMonthsText] = useState('')
   const [saving, setSaving] = useState(false)
 
   const amountMinor = (() => {
@@ -41,6 +36,11 @@ export default function AddDebtModal({ open, onClose, onSaved }: AddDebtModalPro
     if (isNaN(n) || n <= 0) return 0
     return Math.round(n * 100)
   })()
+  const totalMonths = (() => {
+    const n = parseFloat(monthsText)
+    if (isNaN(n) || n <= 0) return 0
+    return Math.floor(n)
+  })()
 
   const valid = amountMinor > 0 && !!nextDueDate
 
@@ -55,12 +55,15 @@ export default function AddDebtModal({ open, onClose, onSaved }: AddDebtModalPro
         feeRate,
         nextDueDate,
         monthlyPayMinor,
+        totalMonths,
       })
       window.dispatchEvent(new CustomEvent('dashboard-refresh'))
       setAmountText('')
       setUse('')
       setFeeText('')
       setMonthlyText('')
+      setMonthsText('')
+      setNextDueDate('')
       onClose()
       onSaved?.()
     } finally {
@@ -201,9 +204,9 @@ export default function AddDebtModal({ open, onClose, onSaved }: AddDebtModalPro
         </div>
 
         {/* 月还款 */}
-        <div style={{ marginBottom: 20 }}>
+        <div style={{ marginBottom: 16 }}>
           <div style={{ fontSize: 13, fontWeight: 500, color: '#374151', marginBottom: 6 }}>
-            月还款 <span style={{ color: '#A0A4A4', fontWeight: 400 }}>（可选）</span>
+            每月还款额 <span style={{ color: '#A0A4A4', fontWeight: 400 }}>（可选）</span>
           </div>
           <input
             value={monthlyText}
@@ -212,6 +215,26 @@ export default function AddDebtModal({ open, onClose, onSaved }: AddDebtModalPro
               if (/^\d*\.?\d{0,2}$/.test(v) || v === '') setMonthlyText(v)
             }}
             inputMode="decimal" placeholder="如 300"
+            style={{
+              width: '100%', padding: '10px 12px', borderRadius: 10,
+              border: '1px solid #C0C4C4', fontSize: 13.5, color: '#111111',
+              outline: 'none', fontFamily: 'var(--font-stack)', boxSizing: 'border-box',
+            }}
+          />
+        </div>
+
+        {/* 需还款月数 */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 500, color: '#374151', marginBottom: 6 }}>
+            需还款月数 <span style={{ color: '#A0A4A4', fontWeight: 400 }}>（可选，如 6）</span>
+          </div>
+          <input
+            value={monthsText}
+            onChange={(e) => {
+              const v = e.target.value
+              if (/^\d{0,2}$/.test(v) || v === '') setMonthsText(v)
+            }}
+            inputMode="numeric" placeholder="如 6"
             style={{
               width: '100%', padding: '10px 12px', borderRadius: 10,
               border: '1px solid #C0C4C4', fontSize: 13.5, color: '#111111',
@@ -229,6 +252,11 @@ export default function AddDebtModal({ open, onClose, onSaved }: AddDebtModalPro
           {amountMinor > 0
             ? `将记入「${platform}」待还 ¥${(amountMinor / 100).toFixed(2)}，并同步一条消费记录`
             : '同平台已存在会自动累加待还，否则自动创建负债账户'}
+          {monthlyPayMinor > 0 && totalMonths > 0 && (
+            <div style={{ marginTop: 4 }}>
+              还款计划：每月 ¥{(monthlyPayMinor / 100).toFixed(2)} × {totalMonths} 个月（约 ¥{((monthlyPayMinor / 100) * totalMonths).toFixed(2)}），仅用于清零日估算，每月还款逐笔记录
+            </div>
+          )}
         </div>
 
         {/* 按钮 */}

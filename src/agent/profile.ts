@@ -10,7 +10,7 @@ import {
   addInsight as addInsightRow,
 } from '../db/crud'
 import type {
-  BehaviorProfile, ConsumerEvent, ConsumerTriggerType, Insight, Mood, Transaction,
+  BehaviorProfile, ConsumerEvent, ConsumerTriggerType, Insight, Mood, Transaction, CoachNote,
 } from '../types'
 import { isImpulsive, platformOf } from '../utils/impulseEngine'
 
@@ -154,6 +154,9 @@ function pct(part: number, total: number): number {
 export async function computeAndSaveProfile(): Promise<BehaviorProfile> {
   const now = Date.now()
   const events = await getAllConsumerEvents()
+  // 统计重算时保留认知教练存档（coachNotes 不参与统计、不被覆盖）
+  const prev = await getBehaviorProfile()
+  const coachNotes = prev?.coachNotes ?? []
 
   const inLast = (t: string, days: number) => {
     const ts = new Date(t).getTime()
@@ -218,6 +221,7 @@ export async function computeAndSaveProfile(): Promise<BehaviorProfile> {
     highRiskWindows,
     highRiskCategories,
     avgPurchaseQuality,
+    coachNotes,
     lastUpdatedAt: new Date().toISOString(),
   }
   await saveBehaviorProfile(profile)
@@ -230,6 +234,35 @@ export async function getProfile(): Promise<BehaviorProfile> {
   if (cached) return cached
   await syncConsumerEvents()
   return computeAndSaveProfile()
+}
+
+// ==================== 认知教练存档（越用越懂用户） ====================
+
+function noteId(): string {
+  const rnd = crypto.randomUUID ? crypto.randomUUID().slice(0, 8) : Math.random().toString(36).slice(2, 10)
+  return `${Date.now()}-${rnd}`
+}
+
+/** 认知教练逐次复盘存档：追加一条笔记并持久化（供下次复盘引用"上次你说…"） */
+export async function addCoachNote(data: {
+  type: CoachNote['type']
+  tag?: string | null
+  content: string
+  dataRef?: string | null
+}): Promise<CoachNote> {
+  const profile = await getProfile()
+  const note: CoachNote = {
+    id: noteId(),
+    ts: new Date().toISOString(),
+    type: data.type,
+    tag: data.tag ?? null,
+    content: data.content,
+    dataRef: data.dataRef ?? null,
+  }
+  profile.coachNotes = [...(profile.coachNotes ?? []), note].slice(-200) // 最多保留 200 条
+  profile.lastUpdatedAt = note.ts
+  await saveBehaviorProfile(profile)
+  return note
 }
 
 // ==================== 画像上下文（喂 LLM / 供 Agent 引用） ====================
@@ -248,6 +281,15 @@ export function profileContextText(p: BehaviorProfile, eventCount30: number): st
   lines.push(p.avgPurchaseQuality != null
     ? `- 近90天购买质量分均值：${p.avgPurchaseQuality}/100（30天使用反馈）`
     : '- 暂无30天使用反馈，无法给出购买质量分')
+  // —— 历次复盘笔记（越用越懂：上次复盘说过的话） ——
+  const notes = (p.coachNotes ?? []).slice(-5)
+  if (notes.length > 0) {
+    lines.push('—— 历次复盘存档（按时间从新到旧，开场可引用）——')
+    for (let i = notes.length - 1; i >= 0; i--) {
+      const n = notes[i]
+      lines.push(`- [${n.ts.slice(0, 10)} ${n.type}]${n.tag ? `（${n.tag}）` : ''} ${n.content}${n.dataRef ? `（数据：${n.dataRef}）` : ''}`)
+    }
+  }
   return lines.join('\n')
 }
 

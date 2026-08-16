@@ -21,7 +21,7 @@ apiRouter.use('/transactions', createCrudRouter({
     isRevoked: 'is_revoked', revokedAt: 'revoked_at', regretValue: 'regret_value',
     regretAt: 'regret_at', importId: 'import_id', note: 'note',
     screenshot: 'screenshot', fundingSource: 'funding_source',
-    lienAccountId: 'lien_account_id', createdAt: 'created_at',
+    lienAccountId: 'lien_account_id', createdAt: 'created_at', updatedAt: 'updated_at',
   },
 }))
 
@@ -32,14 +32,14 @@ apiRouter.use('/savings-goals', createCrudRouter({
     name: 'name', reason: 'reason', image: 'image',
     targetMinor: 'target_minor', currentMinor: 'current_minor',
     milestones: 'milestones', deadline: 'deadline', isActive: 'is_active',
-    revokedContributionsMinor: 'revoked_contributions_minor',
+    revokedContributionsMinor: 'revoked_contributions_minor', updatedAt: 'updated_at',
   },
 }))
 
 // ---- debts ----
 apiRouter.use('/debts', createCrudRouter({
   table: 'debts',
-  fields: { name: 'name', remainingMinor: 'remaining_minor', aprXirr: 'apr_xirr', nextDue: 'next_due', strategy: 'strategy' },
+  fields: { name: 'name', remainingMinor: 'remaining_minor', aprXirr: 'apr_xirr', nextDue: 'next_due', strategy: 'strategy', updatedAt: 'updated_at' },
 }))
 
 // ---- credit-accounts ----
@@ -49,7 +49,7 @@ apiRouter.use('/credit-accounts', createCrudRouter({
     platform: 'platform', nickname: 'nickname', creditLimitMinor: 'credit_limit_minor',
     statementDay: 'statement_day', dueDay: 'due_day', graceDays: 'grace_days',
     minPayRatio: 'min_pay_ratio', rateType: 'rate_type', feeRate: 'fee_rate',
-    createdAt: 'created_at',
+    createdAt: 'created_at', updatedAt: 'updated_at',
   },
 }))
 
@@ -57,14 +57,14 @@ apiRouter.use('/credit-accounts', createCrudRouter({
 apiRouter.use('/schedules', createCrudRouter({
   table: 'schedules',
   orderBy: 'date ASC',
-  fields: { name: 'name', type: 'type', amountMinor: 'amount_minor', date: 'date', repeat: 'repeat', note: 'note', notified: 'notified' },
+  fields: { name: 'name', type: 'type', amountMinor: 'amount_minor', date: 'date', repeat: 'repeat', note: 'note', notified: 'notified', updatedAt: 'updated_at' },
 }))
 
 // ---- settings（主键是 key） ----
 apiRouter.use('/settings', createCrudRouter({
   table: 'settings',
   idCol: 'key',
-  fields: { value: 'value' },
+  fields: { value: 'value', updatedAt: 'updated_at' },
 }))
 
 // ---- dashboard-summary ----

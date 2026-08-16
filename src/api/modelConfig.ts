@@ -11,6 +11,8 @@ import { db } from '../db/database'
 export const DEEPSEEK_API_KEY = 'deepseekApiKey'
 /** settings 表 key：当前模型配置（JSON 字符串） */
 export const MODEL_CONFIG_KEY = 'modelConfig'
+/** settings 表 key：识图模型配置（JSON 字符串，独立存储；未配置时截图识别回退主模型） */
+export const VISION_MODEL_CONFIG_KEY = 'visionModelConfig'
 
 // ==================== 厂商与模型表 ====================
 
@@ -171,4 +173,67 @@ export async function getModelConfig(): Promise<ModelConfig | null> {
 export async function clearModelConfig(): Promise<void> {
   await db.settings.delete(MODEL_CONFIG_KEY)
   await db.settings.delete(DEEPSEEK_API_KEY)
+}
+
+// ==================== 识图模型（双模型分流） ====================
+// 全站 AI 调用集中在 src/api/deepseek.ts 分流：
+// 截图识别 / 图片记账等带图片请求 → 识图模型（getVisionModelConfig）；
+// AI 对话 / AI 报告 / 批量入账解析 / 算法分析等纯文本 → 主模型（getModelConfig）。
+
+/** 保存识图模型配置到 settings 表（key = visionModelConfig，与主模型分开存储） */
+export async function saveVisionModelConfig(cfg: ModelConfig): Promise<void> {
+  await setSetting(VISION_MODEL_CONFIG_KEY, JSON.stringify(cfg))
+}
+
+/**
+ * 读取独立的识图模型配置；未配置时返回 null（不回退主模型，供设置页表单填充用）。
+ * 调用层请用 getVisionModelConfig()（带主模型回退）。
+ */
+export async function getRawVisionModelConfig(): Promise<ModelConfig | null> {
+  const raw = await getSetting(VISION_MODEL_CONFIG_KEY)
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const cfg = JSON.parse(raw) as ModelConfig
+      if (
+        cfg &&
+        typeof cfg.modelName === 'string' && cfg.modelName.trim() &&
+        typeof cfg.apiUrl === 'string' && cfg.apiUrl.trim() &&
+        typeof cfg.apiKey === 'string' && cfg.apiKey.trim()
+      ) {
+        return {
+          provider: cfg.provider ?? 'custom',
+          modelName: cfg.modelName.trim(),
+          apiUrl: cfg.apiUrl.trim(),
+          apiKey: cfg.apiKey.trim(),
+        }
+      }
+    } catch {
+      // 数据损坏则忽略，回退主模型
+    }
+  }
+  return null
+}
+
+/**
+ * 读取识图模型配置；未配置独立识图模型时回退主模型（getModelConfig），
+ * 即「只配主模型：截图识别仍走主模型」。两者都未配置返回 null。
+ */
+export async function getVisionModelConfig(): Promise<ModelConfig | null> {
+  return (await getRawVisionModelConfig()) ?? (await getModelConfig())
+}
+
+/** 清除识图模型配置（主模型不受影响） */
+export async function clearVisionModelConfig(): Promise<void> {
+  await db.settings.delete(VISION_MODEL_CONFIG_KEY)
+}
+
+/** 是否已配置主模型（AI 对话与分析模型） */
+export async function hasMainModel(): Promise<boolean> {
+  return (await getModelConfig()) !== null
+}
+
+/** 是否配置了独立识图模型（不含主模型回退；false 表示截图识别将使用主模型） */
+export async function hasVisionModel(): Promise<boolean> {
+  const raw = await getSetting(VISION_MODEL_CONFIG_KEY)
+  return typeof raw === 'string' && raw.trim().length > 0
 }

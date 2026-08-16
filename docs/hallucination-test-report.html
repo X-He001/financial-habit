@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>幻觉预防测试报告</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #F3F4F6; color: #1F2937; padding: 24px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #6B7280; font-size: 13px; margin-bottom: 18px; }
+  .metrics { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
+  .metric { background: #fff; border: 1px solid #E5E7EB; border-radius: 12px; padding: 14px 18px; min-width: 170px; }
+  .metric .k { font-size: 12px; color: #6B7280; }
+  .metric .v { font-size: 22px; font-weight: 700; margin-top: 4px; }
+  .metric .v.up { color: #059669; }
+  .facts { background: #fff; border: 1px solid #E5E7EB; border-radius: 12px; padding: 14px 18px; margin-bottom: 20px; font-size: 13px; white-space: pre-wrap; line-height: 1.9; }
+  .facts b { color: #374151; }
+  .card { background: #fff; border: 1px solid #E5E7EB; border-left: 5px solid #9CA3AF; border-radius: 12px; padding: 16px 18px; margin-bottom: 18px; }
+  .card.pass { border-left-color: #10B981; }
+  .card.fail { border-left-color: #EF4444; }
+  .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .case-id { font-weight: 800; font-size: 15px; background: #111827; color: #fff; border-radius: 6px; padding: 2px 8px; }
+  .case-name { font-weight: 700; font-size: 15px; }
+  .tag { font-size: 12px; background: #E5E7EB; color: #4B5563; border-radius: 999px; padding: 2px 10px; }
+  .result.ok { color: #059669; font-weight: 700; font-size: 14px; margin-left: auto; }
+  .result.no { color: #EF4444; font-weight: 700; font-size: 14px; margin-left: auto; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 260px; }
+  h4 { font-size: 13px; color: #6B7280; margin: 12px 0 6px; }
+  pre { background: #F9FAFB; border: 1px solid #E5E7EB; border-radius: 8px; padding: 10px 12px; font-size: 13px; white-space: pre-wrap; word-break: break-all; margin: 0; }
+  .issues { margin: 0; padding-left: 4px; list-style: none; }
+  .issues li { padding: 6px 10px; background: #FFF7ED; border: 1px solid #FED7AA; border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
+  .issues li.muted { background: #F9FAFB; border-color: #E5E7EB; color: #6B7280; }
+  .badge { display: inline-block; border-radius: 999px; padding: 1px 8px; font-size: 11px; color: #fff; }
+  .sev-high { background: #EF4444; }
+  .sev-medium { background: #F59E0B; }
+  .sev-low { background: #9CA3AF; }
+  .marked-out { background: #FFFBEB; border: 1px dashed #F59E0B; border-radius: 10px; padding: 12px 14px; font-size: 14px; }
+  .mark-tip { color: #B45309; font-weight: 700; }
+  .nav { position: sticky; top: 0; background: rgba(243,244,246,0.95); padding: 8px 0; margin-bottom: 12px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .nav a { font-size: 12px; color: #374151; text-decoration: none; border: 1px solid #D1D5DB; border-radius: 999px; padding: 3px 10px; background: #fff; }
+</style>
+</head>
+<body>
+<h1>🧪 幻觉预防测试报告（可视化）</h1>
+<div class="sub">评估对象：<code>src/utils/factGuard.ts</code> 事实核查引擎 · 生成时间：2026-08-16 07:18:14 · 完整日志见 <code>hallucination-test-report.md</code></div>
+
+<div class="nav">
+  <a href="#summary">摘要</a>
+  <a href="#case-t01">t01</a><a href="#case-t02">t02</a><a href="#case-t03">t03</a><a href="#case-t04">t04</a><a href="#case-t05">t05</a><a href="#case-t06">t06</a><a href="#case-t07">t07</a><a href="#case-t08">t08</a><a href="#case-t09">t09</a><a href="#case-t10">t10</a>
+</div>
+
+<section class="metrics" id="summary">
+  <div class="metric"><div class="k">幻觉检出率</div><div class="v up">100%</div></div>
+  <div class="metric"><div class="k">误报率</div><div class="v">0 / 2 = 0%</div></div>
+  <div class="metric"><div class="k">基线提升</div><div class="v up">+100pp</div></div>
+  <div class="metric"><div class="k">标注生效项</div><div class="v">6</div></div>
+</section>
+
+<div class="facts"><b>事实集（mock 数据 → collectFacts 收集）</b>
+金额：0、11、15.9、19.9、25、28、59、80、89、129、166、192.9、249、323.9、400、743.8、820.8
+笔数（全局）：1、2、3、4、5、9
+商家/平台：淘宝·优衣库T恤、拼多多·零食大礼包、拼多多·手机壳、拼多多·数据线、美团·奶茶、抖音·耳机、拼多多·保温杯、京东·机械键盘、淘宝·袜子、拼多多
+实体级笔数：{&quot;拼多多&quot;:[4],&quot;拼多多·零食大礼包&quot;:[3]}</div>
+
+<section class="card pass" id="case-t01">
+  <div class="card-head">
+    <span class="case-id">t01</span>
+    <span class="case-name">正常总结（全部引用真实数据）</span>
+    <span class="tag">正常（误报检查）</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">今日支出 <b>¥743.8</b>（9 笔），本月已超支：支出 <b>¥820.8</b> / 预算 <b>¥400</b>。拼多多今日 <b>4 笔</b> 共 <b>¥192.9</b>，超过限额 <b>¥80</b>；深夜 <b>3 笔</b>；「拼多多·零食大礼包」近 30 天 <b>3 次</b> 共 <b>¥166</b>。今日冲动等级以高和很高为主，最高频是拼多多。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>今日支出 ¥743.8（9 笔），本月已超支：支出 ¥820.8 / 预算 ¥400。拼多多今日 4 笔 共 ¥192.9，超过限额 ¥80；深夜 3 笔；「拼多多·零食大礼包」近 30 天 3 次 共 ¥166。今日冲动等级以高和很高为主，最高频是拼多多。</pre></div>
+  </div>
+  <h4>检出问题（0 条）</h4>
+  <ul class="issues"><li class="muted">（无问题，正常输出）</li></ul>
+  <h4>核查后输出（标注版）</h4>
+  <div class="marked-out"><div style="padding:12px">今日支出 <b>¥743.8</b>（9 笔），本月已超支：支出 <b>¥820.8</b> / 预算 <b>¥400</b>。拼多多今日 <b>4 笔</b> 共 <b>¥192.9</b>，超过限额 <b>¥80</b>；深夜 <b>3 笔</b>；「拼多多·零食大礼包」近 30 天 <b>3 次</b> 共 <b>¥166</b>。今日冲动等级以高和很高为主，最高频是拼多多。</div></div>
+</section>
+<section class="card pass" id="case-t02">
+  <div class="card-head">
+    <span class="case-id">t02</span>
+    <span class="case-name">金额捏造（快照没有的手机支架 ¥128）</span>
+    <span class="tag">金额幻觉</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">你最近买了个手机支架 <b>¥128</b>，还有耳机 <b>¥129</b>，建议克制这类配件消费。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>你最近买了个手机支架 ¥128，还有耳机 ¥129，建议克制这类配件消费。</pre></div>
+  </div>
+  <h4>检出问题（1 条） · <b>已拦截</b></h4>
+  <ul class="issues"><li><span class="badge sev-high">high</span> <code>amount</code>「<code>¥128</code>」→ 金额 ¥128 不在已核对数据中（可能编造）</li></ul>
+  <h4>核查后输出（标注版） · <span class="mark-tip">已含「⚠ 未核实」标注</span></h4>
+  <div class="marked-out"><div style="padding:12px">你最近买了个手机支架 <b>¥128<span style="display:inline-block;margin:0 2px;padding:0 5px;border-radius:4px;background:#FEF3C7;color:#B45309;font-size:11px;line-height:1.7;white-space:nowrap">⚠ 未核实</span></b>，还有耳机 <b>¥129</b>，建议克制这类配件消费。</div></div>
+</section>
+<section class="card pass" id="case-t03">
+  <div class="card-head">
+    <span class="case-id">t03</span>
+    <span class="case-name">金额错误（抖音耳机写成 ¥139，实际 ¥129）</span>
+    <span class="tag">金额幻觉</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">那笔抖音耳机花了 <b>¥139</b>，属于很高的冲动消费。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>那笔抖音耳机花了 ¥139，属于很高的冲动消费。</pre></div>
+  </div>
+  <h4>检出问题（1 条） · <b>已拦截</b></h4>
+  <ul class="issues"><li><span class="badge sev-high">high</span> <code>amount</code>「<code>¥139</code>」→ 金额 ¥139 不在已核对数据中（可能编造）</li></ul>
+  <h4>核查后输出（标注版） · <span class="mark-tip">已含「⚠ 未核实」标注</span></h4>
+  <div class="marked-out"><div style="padding:12px">那笔抖音耳机花了 <b>¥139<span style="display:inline-block;margin:0 2px;padding:0 5px;border-radius:4px;background:#FEF3C7;color:#B45309;font-size:11px;line-height:1.7;white-space:nowrap">⚠ 未核实</span></b>，属于很高的冲动消费。</div></div>
+</section>
+<section class="card pass" id="case-t04">
+  <div class="card-head">
+    <span class="case-id">t04</span>
+    <span class="case-name">商家编造（重复购买率高 → 编造&quot;纸巾买了 3 次&quot;）</span>
+    <span class="tag">商家幻觉</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">你的日用百货重复购买率偏高，比如纸巾 <b>3 次</b>，要留意囤货冲动。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>你的日用百货重复购买率偏高，比如纸巾 3 次，要留意囤货冲动。</pre></div>
+  </div>
+  <h4>检出问题（1 条） · <b>已拦截</b></h4>
+  <ul class="issues"><li><span class="badge sev-medium">medium</span> <code>merchant</code>「<code>买率偏</code>」→ 「率偏」不在已核对数据中（可能编造）</li></ul>
+  <h4>核查后输出（标注版） · <span class="mark-tip">已含「⚠ 未核实」标注</span></h4>
+  <div class="marked-out"><div style="padding:12px">你的日用百货重复购买率偏<span style="display:inline-block;margin:0 2px;padding:0 5px;border-radius:4px;background:#FEF3C7;color:#B45309;font-size:11px;line-height:1.7;white-space:nowrap">⚠ 未核实</span>高，比如纸巾 <b>3 次</b>，要留意囤货冲动。</div></div>
+</section>
+<section class="card pass" id="case-t05">
+  <div class="card-head">
+    <span class="case-id">t05</span>
+    <span class="case-name">笔数脑补（拼多多实际 4 笔，写成 6 笔）</span>
+    <span class="tag">笔数幻觉</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">拼多多今天一口气买了 <b>6 笔</b>，属于同平台爆发。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>拼多多今天一口气买了 6 笔，属于同平台爆发。</pre></div>
+  </div>
+  <h4>检出问题（1 条） · <b>已拦截</b></h4>
+  <ul class="issues"><li><span class="badge sev-low">low</span> <code>count</code>「<code>6 笔</code>」→ 笔数/次数 6 未能在已核对数据中找到依据</li></ul>
+  <h4>核查后输出（标注版）</h4>
+  <div class="marked-out"><div style="padding:12px">拼多多今天一口气买了 <b>6 笔</b>，属于同平台爆发。</div></div>
+</section>
+<section class="card pass" id="case-t06">
+  <div class="card-head">
+    <span class="case-id">t06</span>
+    <span class="case-name">0-100 分数泄漏（冲动分 78）</span>
+    <span class="tag">分数泄漏</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">那笔耳机的冲动分 <b>78</b>，说明当时冲动很强。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>那笔耳机的冲动分 78，说明当时冲动很强。</pre></div>
+  </div>
+  <h4>检出问题（1 条） · <b>已拦截</b></h4>
+  <ul class="issues"><li><span class="badge sev-high">high</span> <code>score</code>「<code>冲动分 78</code>」→ 0-100 分数 78 不应展示给用户（只用等级词）</li></ul>
+  <h4>核查后输出（标注版）</h4>
+  <div class="marked-out"><div style="padding:12px">那笔耳机的冲动分 <b>78</b>，说明当时冲动很强。</div></div>
+</section>
+<section class="card pass" id="case-t07">
+  <div class="card-head">
+    <span class="case-id">t07</span>
+    <span class="case-name">统计脑补（高频场景 → 编造商品&quot;洗衣液&quot;）</span>
+    <span class="tag">商家幻觉</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">你最近高频买日用百货，比如那瓶洗衣液就很典型。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>你最近高频买日用百货，比如那瓶洗衣液就很典型。</pre></div>
+  </div>
+  <h4>检出问题（1 条） · <b>已拦截</b></h4>
+  <ul class="issues"><li><span class="badge sev-medium">medium</span> <code>merchant</code>「<code>买日用</code>」→ 「日用」不在已核对数据中（可能编造）</li></ul>
+  <h4>核查后输出（标注版） · <span class="mark-tip">已含「⚠ 未核实」标注</span></h4>
+  <div class="marked-out"><div style="padding:12px">你最近高频买日用<span style="display:inline-block;margin:0 2px;padding:0 5px;border-radius:4px;background:#FEF3C7;color:#B45309;font-size:11px;line-height:1.7;white-space:nowrap">⚠ 未核实</span>百货，比如那瓶洗衣液就很典型。</div></div>
+</section>
+<section class="card pass" id="case-t08">
+  <div class="card-head">
+    <span class="case-id">t08</span>
+    <span class="case-name">不确定标识边界（&quot;数据暂缺&quot;不应被标为幻觉）</span>
+    <span class="tag">正常（误报检查）</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">拼多多今日部分记录数据暂缺，暂无法统计精确笔数。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>拼多多今日部分记录数据暂缺，暂无法统计精确笔数。</pre></div>
+  </div>
+  <h4>检出问题（0 条）</h4>
+  <ul class="issues"><li class="muted">（无问题，正常输出）</li></ul>
+  <h4>核查后输出（标注版）</h4>
+  <div class="marked-out"><div style="padding:12px">拼多多今日部分记录数据暂缺，暂无法统计精确笔数。</div></div>
+</section>
+<section class="card pass" id="case-t09">
+  <div class="card-head">
+    <span class="case-id">t09</span>
+    <span class="case-name">平台编造（在&quot;得物&quot;买了 3 单，实际无此平台）</span>
+    <span class="tag">商家幻觉</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">你近 7 天在得物买了 <b>3 单</b>，建议留意这类平台。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>你近 7 天在得物买了 3 单，建议留意这类平台。</pre></div>
+  </div>
+  <h4>检出问题（1 条） · <b>已拦截</b></h4>
+  <ul class="issues"><li><span class="badge sev-medium">medium</span> <code>merchant</code>「<code>在得物买了</code>」→ 「得物」不在已核对数据中（可能编造）</li></ul>
+  <h4>核查后输出（标注版） · <span class="mark-tip">已含「⚠ 未核实」标注</span></h4>
+  <div class="marked-out"><div style="padding:12px">你近 7 天在得物买了<span style="display:inline-block;margin:0 2px;padding:0 5px;border-radius:4px;background:#FEF3C7;color:#B45309;font-size:11px;line-height:1.7;white-space:nowrap">⚠ 未核实</span> <b>3 单</b>，建议留意这类平台。</div></div>
+</section>
+<section class="card pass" id="case-t10">
+  <div class="card-head">
+    <span class="case-id">t10</span>
+    <span class="case-name">次数编造（5 天前买过 2 次，实际只有零食 1 次）</span>
+    <span class="tag">笔数幻觉</span>
+    <span class="result ok">✅ 通过</span>
+  </div>
+  <div class="row">
+    <div class="col"><h4>输入（AI 输出原文）</h4><div style="padding:12px">5 天前你买了 <b>2 次</b> 拼多多零食。</div></div>
+    <div class="col"><h4>纯文本</h4><pre>5 天前你买了 2 次 拼多多零食。</pre></div>
+  </div>
+  <h4>检出问题（1 条） · <b>已拦截</b></h4>
+  <ul class="issues"><li><span class="badge sev-medium">medium</span> <code>count</code>「<code>2 次</code>」→ 「拼多多零食」相关笔数 2 与已核对数据不符（已知：4）</li></ul>
+  <h4>核查后输出（标注版） · <span class="mark-tip">已含「⚠ 未核实」标注</span></h4>
+  <div class="marked-out"><div style="padding:12px">5 天前你买了 <b>2 次<span style="display:inline-block;margin:0 2px;padding:0 5px;border-radius:4px;background:#FEF3C7;color:#B45309;font-size:11px;line-height:1.7;white-space:nowrap">⚠ 未核实</span></b> 拼多多零食。</div></div>
+</section>
+</body>
+</html>

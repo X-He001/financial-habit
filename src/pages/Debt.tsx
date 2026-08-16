@@ -105,7 +105,11 @@ export default function Debt() {
     setAdviceLoading(true)
     try {
       const r = await runDebtAdvice(q)
-      setAdviceHtml(r.html)
+      // 渲染层兜底：AI 输出中被系统校正/标注的数字给出提示（透明、可追溯）
+      const correctedNote = r.corrected > 0
+        ? `<div style="margin-bottom:8px;padding:8px 12px;background:#FFFBEB;border:1px solid #FDE68A;border-radius:10px;font-size:11.5px;color:#B45309;line-height:1.6">⚠ 系统已校正 ${r.corrected} 处数字：AI 输出与你的负债数据不一致，已自动按代码算好的真实值修正（鼠标悬停「校正」可查看原值）。</div>`
+        : ''
+      setAdviceHtml(correctedNote + r.html)
     } catch {
       setAdviceHtml('<p style="color:#888888">⚠️ 顾问暂时不可用，请稍后再试</p>')
     } finally {
@@ -484,9 +488,29 @@ export default function Debt() {
                     <div style={{ fontSize: 24, fontWeight: 700, color: a.principalRemMinor > 0 ? '#111111' : '#22D3EE', fontVariantNumeric: 'tabular-nums', marginTop: 2 }}>
                       ¥{fmtYuanShort(a.principalRemMinor)}
                     </div>
-                    <div style={{ fontSize: 11.5, color: '#888888', marginTop: 2 }}>真实年化 {a.realApr}%</div>
                   </div>
                 </div>
+                {/* 利息显形：每日利息（大号）+ 年化并排，数字全部由代码算 */}
+                {(a.principalRemMinor > 0 || a.realApr > 0) && (
+                  <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap', background: '#E4E6E6', borderRadius: 10, padding: '10px 14px' }}>
+                    <div>
+                      <div style={{ fontSize: 11.5, color: '#888888' }}>每日利息</div>
+                      <div style={{ fontSize: 22, fontWeight: 700, color: a.realApr > 2 ? '#DC2626' : '#0040FF', fontVariantNumeric: 'tabular-nums', marginTop: 1 }}>
+                        ¥{fmtYuan(Math.round(a.principalRemMinor * a.dailyRate))}
+                        <span style={{ fontSize: 12, fontWeight: 600, color: '#888888', marginLeft: 2 }}>/天</span>
+                      </div>
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, color: '#111111', lineHeight: 1.7 }}>
+                        年化 <b style={{ fontVariantNumeric: 'tabular-nums' }}>{a.realApr}%</b>
+                        {a.realApr > 0 && <span> · 是储蓄收益（2%）的 <b style={{ color: a.realApr / 2 >= 5 ? '#DC2626' : '#F59E0B', fontVariantNumeric: 'tabular-nums' }}>{Math.round((a.realApr / 2) * 10) / 10}</b> 倍</span>}
+                      </div>
+                      {a.principalRemMinor > 0 && a.dailyRate > 0 && (
+                        <div style={{ fontSize: 11.5, color: '#888888', marginTop: 2 }}>每拖一天，利息就多一笔——早还清一天，就少亏一天</div>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {a.isMinOnly && warnInterest > 0 && (
                   <div style={{ marginTop: 12, background: '#FEF2F2', border: '1px solid rgba(220,38,38,0.35)', borderRadius: 10, padding: '9px 12px', fontSize: 12, color: '#DC2626', lineHeight: 1.7 }}>
                     ⚠️ 只还最低还款会利滚利：剩余本金 ¥{fmtYuanShort(a.principalRemMinor)} 按日计息，30 天将多产生约 <b>¥{fmtYuan(warnInterest)}</b> 利息。建议尽快全额结清。

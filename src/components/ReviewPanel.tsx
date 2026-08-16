@@ -305,7 +305,7 @@ function ReviewPanel({ tx, onClose }: { tx: Transaction; onClose: () => void }) 
         <span style={{ width: 34, height: 34, borderRadius: '50%', background: '#0040FF', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 17, flexShrink: 0 }}>🧊</span>
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 15, fontWeight: 700, color: '#111111' }}>今日冲动复盘</div>
-          <div style={{ fontSize: 11.5, color: '#888888' }}>数据驱动的行为教练 · 数字本地计算，AI 只说人话</div>
+          <div style={{ fontSize: 11.5, color: '#888888' }}>数据驱动的 AI 助手 · 数字本地计算，AI 只说人话</div>
         </div>
         <button onClick={onClose} style={{ background: 'none', border: 'none', fontSize: 16, color: '#888888', cursor: 'pointer', padding: 4 }}>✕</button>
       </div>

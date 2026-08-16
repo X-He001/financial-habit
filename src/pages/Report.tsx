@@ -1,8 +1,14 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import RichMessage, { hasRichBlock } from '../components/RichMessage'
+import Markdown from '../components/Markdown'
+import AiHtml, { isHtmlContent } from '../components/AiHtml'
+import ReportCoachChat from '../components/ReportCoachChat'
 import { generateReport, hasApiKey, aiErrorMessage } from '../api/deepseek'
+import { runLoop } from '../agent/loopEngine'
+import { applyCoachEnvAction } from '../agent/coachEngine'
 import { getDayFacts, getWeekFacts, getMonthFacts } from '../utils/aiFacts'
 import { dayTemplate, weekTemplate, monthTemplate, verifyAiNumbers } from '../utils/reportTemplates'
+import { CORRECTED_BY_SYSTEM } from '../utils/factGuard'
 import { getAiMonthCount, incrementAiCount } from '../utils/aiUsage'
 import { getSetting, setSetting, deleteSchedule, updateSavingsGoal } from '../db/crud'
 import { db } from '../db/database'
@@ -16,10 +22,31 @@ import {
 
 type Tab = 'day' | 'week' | 'month'
 const TABS: Array<{ key: Tab; label: string }> = [
-  { key: 'day', label: '📅 每日摘要' },
+  { key: 'day', label: '📅 今日 AI 总结' },
   { key: 'week', label: '📊 每周分析' },
   { key: 'month', label: '📈 每月复盘' },
 ]
+const PERIOD_LABEL: Record<Tab, string> = { day: '每日', week: '每周', month: '每月' }
+
+/** 自主循环生成的 AI 总结（HTML）缓存 */
+interface LoopSummary { html: string; date: string; toolCount: number; guardIssues: number }
+type LoopCache = Partial<Record<Tab, LoopSummary>>
+
+const LOOP_CACHE_KEY = 'aiLoopSummaryCache'
+
+async function loadLoopCache(): Promise<LoopCache> {
+  const raw = await getSetting(LOOP_CACHE_KEY)
+  if (typeof raw !== 'string') return {}
+  try {
+    const parsed = JSON.parse(raw) as LoopCache
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+async function saveLoopCache(cache: LoopCache) {
+  await setSetting(LOOP_CACHE_KEY, JSON.stringify(cache))
+}
 
 interface ReportState { text: string; totalCount: number; date: string }
 interface Cache { [k: string]: ReportState }
@@ -46,6 +73,12 @@ async function saveCache(cache: Cache) {
 
 function pad2(n: number): string { return String(n).padStart(2, '0') }
 function dateKey(d: Date): string { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` }
+
+// 冲动等级标签（前台只展示等级，不展示 0-100 冲动分）
+const IMPULSE_LEVEL_LABEL: Record<string, string> = { low: '低', medium: '中', high: '高', veryHigh: '很高' }
+function impulseLabel(level: string): string {
+  return IMPULSE_LEVEL_LABEL[level] ?? level
+}
 
 // ==================== facts 类型 ====================
 
@@ -114,6 +147,9 @@ export default function Report() {
   const [toast, setToast] = useState<string | null>(null)
   const [aiCount, setAiCount] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  // 自主循环生成的 AI 总结（今日 AI 总结 / 周 / 月）
+  const [loopSum, setLoopSum] = useState<LoopCache>({})
+  const [loopLoading, setLoopLoading] = useState<Tab | null>(null)
   // 下钻明细弹层
   const [sheet, setSheet] = useState<{ title: string; txs: TxItem[] } | null>(null)
   // 月报「调整储蓄目标」内联编辑
@@ -121,6 +157,8 @@ export default function Report() {
   const [goalInput, setGoalInput] = useState('')
   // 响应式：<900px 降单栏
   const [isWide, setIsWide] = useState(window.innerWidth >= 900)
+  /** 自主循环互斥锁（同一时间只跑一个循环） */
+  const loopBusyRef = useRef<Tab | null>(null)
 
   // —— 显示"已生效"提示（2.5 秒自动消失） ——
   function toastIt(msg: string) {
@@ -149,6 +187,17 @@ export default function Report() {
 
   useEffect(() => {
     void refreshFacts(tab)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab])
+
+  // 打开页面/切换页签：加载 AI 总结缓存；今天还没生成且已配置 Key → 自动跑一次自主循环
+  useEffect(() => {
+    void (async () => {
+      const cached = await loadLoopCache()
+      setLoopSum(cached)
+      if (cached[tab]?.date === todayStr()) return
+      if (await hasApiKey()) void runLoopAI(tab)
+    })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab])
 
@@ -190,7 +239,7 @@ export default function Report() {
         await refreshCount()
         if (!verifyAiNumbers(text, facts)) {
           text = type === 'day' ? dayTemplate(facts) : type === 'week' ? weekTemplate(facts) : monthTemplate(facts)
-          setNotice('AI 返回内容与真实数据有出入，已改用本地计算结果展示')
+          setNotice(`AI 返回内容与真实数据有出入，${CORRECTED_BY_SYSTEM}（已改用本地计算结果展示）`)
         }
       } catch (e) {
         text = type === 'day' ? dayTemplate(facts) : type === 'week' ? weekTemplate(facts) : monthTemplate(facts)
@@ -208,11 +257,126 @@ export default function Report() {
     }
   }
 
+  // ==================== 自主循环 Agent：一键生成 AI 总结（今日/每周/每月） ====================
+
+  const LOOP_GOAL: Record<Tab, string> = {
+    day: '生成今日 AI 总结：分析今日消费（支出、预算、冲动等级分布、消费事件），给出关键结论与下一步建议',
+    week: '生成每周复盘：分析本周消费模式与变化（支出、储蓄、冲动、高消费日），给出风险点与下周建议',
+    month: '生成每月复盘：分析本月收支、预算执行、冲动、负债与储蓄，给出下月计划建议',
+  }
+
+  /** AI 输出里的可执行按钮（env: 真实写 settings；ask: 引导去下方继续提问） */
+  function handleLoopAction(action: string) {
+    if (action.startsWith('env:')) {
+      const parts = action.split(':')
+      const id = parts[1] ?? ''
+      const platform = parts.slice(2).join(':') || undefined
+      void applyCoachEnvAction(id, platform).then(r => toastIt(r.ok ? `✅ ${r.message}` : `⚠️ ${r.message}`))
+    } else if (action.startsWith('ask:')) {
+      toastIt('可以点击下方「与 AI 助手继续复盘」向我提问')
+    }
+  }
+
+  /**
+   * 一键生成：自主循环 Agent（runLoop）完成 规划→查数→自查→输出。
+   * - 传入真实数据快照（代码算好的数字）供 AI 引用；AI 同时会自主调用工具补查。
+   * - 失败降级到旧文本报告（handleGenerate），保证页面不崩、有内容可看。
+   */
+  async function runLoopAI(type: Tab) {
+    if (loopBusyRef.current) return
+    const ok = await hasApiKey()
+    if (!ok) { setError('请先到设置页配置 API Key，才能生成 AI 分析'); return }
+    loopBusyRef.current = type
+    setLoopLoading(type)
+    setNotice(null)
+    try {
+      const facts = type === 'day' ? await getDayFacts() : type === 'week' ? await getWeekFacts() : await getMonthFacts()
+      setFactsMap(prev => ({ ...prev, [type]: facts as unknown as AnyFacts }))
+      const res = await runLoop(LOOP_GOAL[type], {
+        snapshot: reportSnapshotText(type, facts as unknown as AnyFacts),
+        onStatus: () => { /* 单行 loading 已覆盖，工具级提示在窗口通道展示 */ },
+        onProgress: () => { /* 保持单行 loading，不刷屏 */ },
+      })
+      const entry: LoopSummary = { html: res.html, date: todayStr(), toolCount: res.toolCount, guardIssues: res.guardIssues.length }
+      setLoopSum(prev => ({ ...prev, [type]: entry }))
+      const prevCache = await loadLoopCache()
+      await saveLoopCache({ ...prevCache, [type]: entry })
+      await refreshCount()
+    } catch (e) {
+      setNotice(`AI 自主分析失败（${aiErrorMessage(e)}），已改用本地计算展示`)
+      await handleGenerate(type)
+    } finally {
+      loopBusyRef.current = null
+      setLoopLoading(null)
+    }
+  }
+
   const current = reports[tab]
-  const isToday = current?.date === todayStr()
   const dayF = factsMap.day as DayFacts | undefined
   const weekF = factsMap.week as WeekFacts | undefined
   const monthF = factsMap.month as MonthFacts | undefined
+
+  /** 把报告 facts 压成一行行真实数字快照，供 AI 复盘/自主循环引用（数字由代码算好，AI 只组织语言） */
+  function reportSnapshotText(t: Tab, f?: AnyFacts): string {
+    if (t === 'day') {
+      const day = (f ?? factsMap.day) as DayFacts | undefined
+      if (day) {
+        const budgetPct = day.budget > 0 ? Math.round((day.monthExpense / day.budget) * 100) : 0
+        // 冲动等级分布（只报等级与笔数，不报 0-100 分数）
+        const distMap = new Map<string, number>()
+        for (const tx of day.todayTxs) {
+          const lv = impulseLabel(tx.impulseLevel)
+          distMap.set(lv, (distMap.get(lv) ?? 0) + 1)
+        }
+        const distText = distMap.size > 0
+          ? [...distMap.entries()].map(([lv, n]) => `${lv} ${n} 笔`).join('、')
+          : '无'
+        return [
+          `今日支出 ${fmtY(day.todayExpense)}（${day.todayCount} 笔），今日收入 ${fmtY(day.todayIncome)}`,
+          `本月预算 ${fmtY(day.budget)}，已支出 ${fmtY(day.monthExpense)}（使用率 ${budgetPct}%），剩余 ${fmtY(Math.max(0, day.remaining))}，本月还剩 ${day.restDays} 天，日均可用 ${fmtY(day.dailyBudget)}`,
+          `今日冲动等级分布：${distText}`,
+          `今日 Top3 支出：${day.top3.length > 0 ? day.top3.map(x => `${x.merchant} ${fmtY(x.amount)}`).join('、') : '无'}`,
+        ].join('\n')
+      }
+    }
+    if (t === 'week') {
+      const week = (f ?? factsMap.week) as WeekFacts | undefined
+      if (week) {
+        return [
+          `本周支出 ${fmtY(week.weekExpense)}${week.weekDeltaPct === null ? '' : `（较上周 ${week.weekDeltaPct > 0 ? '+' : ''}${week.weekDeltaPct}%）`}`,
+          `本周储蓄 ${fmtY(week.weekSaving)}，储蓄率 ${week.savingsRate}%（目标 25%）`,
+          `冲动消费 ${week.impulseCount} 笔共 ${fmtY(week.impulseTotal)}（深夜 ${week.lateNightCount} 次）`,
+          `最高频场景：${week.topScene ? `${week.topScene.scene}（${week.topScene.count} 次）` : '暂无'}`,
+          `最大变化分类：${week.catDelta ? `${week.catDelta.category} ${week.catDelta.deltaPct > 0 ? '+' : ''}${week.catDelta.deltaPct}%` : '暂无'}`,
+          week.highWeekdays.length > 0
+            ? `历史高消费日：${week.highWeekdays.map(h => `${h.day}（日均 ${fmtY(h.avg)}）`).join('、')}`
+            : '暂无历史高消费日规律',
+        ].join('\n')
+      }
+    }
+    if (t === 'month') {
+      const month = (f ?? factsMap.month) as MonthFacts | undefined
+      if (month) {
+        const savingsRate = month.income > 0
+          ? Math.round((month.savings / month.income) * 100)
+          : (month.budget > 0 ? Math.round((month.savings / month.budget) * 100) : 0)
+        const topCats = month.categoryDetail.slice(0, 3)
+        return [
+          `本月总支出 ${fmtY(month.monthExpense)}（较上月 ${month.expenseDeltaPct === null ? '暂无数据' : `${month.expenseDeltaPct > 0 ? '+' : ''}${month.expenseDeltaPct}%`}），收入 ${fmtY(month.income)}，净储蓄 ${fmtY(month.savings)}，储蓄率 ${savingsRate}%`,
+          `预算 ${fmtY(month.budget)}，已用 ${month.budgetUsedPct}%，财务健康分 ${month.healthScore}`,
+          `分类 Top：${topCats.length > 0 ? topCats.map(c => `${c.category} ${fmtY(c.amount)}（占 ${c.pct}%）`).join('、') : '暂无'}`,
+          `冲动本月 ${month.impulseThisCount} 笔共 ${fmtY(month.impulseThisTotal)}（上月 ${month.impulseLastCount} 笔共 ${fmtY(month.impulseLastTotal)}）`,
+          `负债合计 ${fmtY(month.debtTotal)}（${month.debtCount} 笔）${month.debtDelta !== 0 ? `，较上月${month.debtDelta < 0 ? '减少' : '增加'} ${fmtY(Math.abs(month.debtDelta))}` : ''}`,
+          month.savingsGoal ? `储蓄目标「${month.savingsGoal.name}」进度 ${month.savingsGoal.pct ?? 0}%（已存 ${fmtY(month.savingsGoal.current)} / ${fmtY(month.savingsGoal.target)}）` : '暂无储蓄目标',
+          month.recurringDeductions.length > 0
+            ? `自动扣费：${month.recurringDeductions.slice(0, 3).map(r => `${r.merchant} ${fmtY(r.amount)}/月`).join('、')}`
+            : '近 3 个月无重复自动扣费',
+          month.subscriptionMonthly > 0 ? `订阅月成本合计 ${fmtY(month.subscriptionMonthly)}` : '',
+        ].filter(Boolean).join('\n')
+      }
+    }
+    return ''
+  }
 
   // ==================== 每日摘要 ====================
   function daySection() {
@@ -245,7 +409,7 @@ export default function Report() {
                 merchant: t.merchant,
                 amount: t.amount,
                 sub: `${t.time} · ${t.category} · ${t.paymentMethod}`,
-                extra: t.impulseLevel !== 'low' ? `冲动${t.impulseScore}分` : undefined,
+                extra: t.impulseLevel !== 'low' ? `冲动·${impulseLabel(t.impulseLevel)}` : undefined,
               })),
             })
           }} />
@@ -302,7 +466,7 @@ export default function Report() {
                 txs: dayF.todayTxs.map(t => ({
                   merchant: t.merchant, amount: t.amount,
                   sub: `${t.time} · ${t.category} · ${t.paymentMethod}`,
-                  extra: t.impulseLevel !== 'low' ? `冲动${t.impulseScore}分` : undefined,
+                  extra: t.impulseLevel !== 'low' ? `冲动·${impulseLabel(t.impulseLevel)}` : undefined,
                 })),
               })
             }}>
@@ -644,22 +808,22 @@ export default function Report() {
 
           {/* 生成按钮 + 缓存提示 */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
-            {current && isToday ? (
+            {loopSum[tab]?.date === todayStr() ? (
               <>
                 <span style={{
                   padding: '10px 22px', borderRadius: 10, fontSize: 14, fontWeight: 600,
                   background: '#10B98114', color: '#059669',
                 }}>✓ 今日已生成</span>
-                <button onClick={() => handleGenerate(tab)} disabled={loading !== null}
-                  className="btn-primary" style={{ padding: '10px 22px', opacity: loading ? 0.6 : 1 }}>
-                  {loading === tab ? '⏳ 生成中…' : '🔄 重新生成'}
+                <button onClick={() => void runLoopAI(tab)} disabled={loopLoading !== null || loading !== null}
+                  className="btn-primary" style={{ padding: '10px 22px', opacity: loopLoading ? 0.6 : 1 }}>
+                  {loopLoading === tab ? '⏳ AI 自主分析中…' : '🔄 重新生成'}
                 </button>
-                <span style={{ fontSize: 12, color: '#F59E0B' }}>今日报告已生成，可重新生成</span>
+                <span style={{ fontSize: 12, color: '#F59E0B' }}>AI 自主循环生成，可随时重新生成</span>
               </>
             ) : (
-              <button onClick={() => handleGenerate(tab)} disabled={loading !== null}
-                className="btn-primary" style={{ padding: '10px 26px', opacity: loading ? 0.6 : 1 }}>
-                {loading === tab ? '⏳ 生成中，AI 正在分析你的数据…' : '✨ 生成报告'}
+              <button onClick={() => void runLoopAI(tab)} disabled={loopLoading !== null || loading !== null}
+                className="btn-primary" style={{ padding: '10px 26px', opacity: loopLoading ? 0.6 : 1 }}>
+                {loopLoading === tab ? '⏳ AI 正在自主查数据并分析…' : '✨ 生成 AI 总结'}
               </button>
             )}
             {notice && <span style={{ fontSize: 12, color: '#A0A4A4' }}>{notice}</span>}
@@ -676,19 +840,54 @@ export default function Report() {
             </>
           )}
 
-          {/* AI 解读区 */}
-          {current && loading !== tab && (
-            <div className="card" style={{ padding: 24, marginBottom: 24 }}>
-              <div style={{ fontSize: 18, fontWeight: 700, color: '#111111', marginBottom: 16 }}>
-                🤖 AI 解读 <span style={{ fontSize: 13, color: '#A0A4A4', fontWeight: 400, marginLeft: 8 }}>{current.date}</span>
+          {/* AI 分析总结（自主循环 Agent 生成，HTML；失败降级为旧文本报告） */}
+          <div className="card" style={{ padding: 24, marginBottom: 24 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 16 }}>
+              <div style={{ fontSize: 18, fontWeight: 700, color: '#111111' }}>
+                🤖 AI 分析总结
+                {loopSum[tab] && <span style={{ fontSize: 13, color: '#A0A4A4', fontWeight: 400, marginLeft: 8 }}>{loopSum[tab].date}</span>}
               </div>
-              {hasRichBlock(current.text)
-                ? <RichMessage content={current.text} />
-                : <div style={{ fontSize: 14, color: '#374151', lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>{current.text}</div>}
-              <div style={{ marginTop: 20, paddingTop: 14, borderTop: '1px dashed #C0C4C4', fontSize: 12, color: '#A0A4A4' }}>
-                本报告基于你 {current.totalCount} 条真实记录生成 · 数字均由本地计算，AI 只负责组织语言
-              </div>
+              {loopLoading === tab && <span style={{ fontSize: 12, color: '#888888' }}>AI 正在自主查数据并分析…（无需操作）</span>}
             </div>
+            {loopLoading === tab ? (
+              <LoadingBox text="AI 正在自主查数据并分析你的消费…" />
+            ) : loopSum[tab]?.html ? (
+              <>
+                <AiHtml html={loopSum[tab].html} onAction={(a) => handleLoopAction(a)} />
+                <div style={{ marginTop: 20, paddingTop: 14, borderTop: '1px dashed #C0C4C4', fontSize: 12, color: '#A0A4A4' }}>
+                  🤖 自主循环查询了 {loopSum[tab].toolCount} 次真实数据 · 数字均由本地代码计算，AI 只组织语言
+                  {(loopSum[tab].guardIssues ?? 0) === 0
+                    ? ' · ✅ 事实核查通过（金额/商家/笔数与真实数据一致）'
+                    : ` · ⚠️ 事实核查标注 ${loopSum[tab].guardIssues} 处未核实信息（黄色 ⚠ 标记处请以实际记账为准）`}
+                </div>
+              </>
+            ) : current ? (
+              <>
+                {hasRichBlock(current.text)
+                  ? <RichMessage content={current.text} />
+                  : isHtmlContent(current.text)
+                    ? <AiHtml html={current.text} />
+                    : <Markdown md={current.text} />}
+                <div style={{ marginTop: 20, paddingTop: 14, borderTop: '1px dashed #C0C4C4', fontSize: 12, color: '#A0A4A4' }}>
+                  本报告基于你 {current.totalCount} 条真实记录生成 · 数字均由本地计算，AI 只负责组织语言
+                </div>
+              </>
+            ) : (
+              <div style={{ textAlign: 'center', padding: '30px 0', color: '#888888', fontSize: 13, lineHeight: 2 }}>
+                点击上方「✨ 生成 AI 总结」，AI 将自主查数据、分析并输出总结
+                <br />（需先在设置页配置 API Key）
+              </div>
+            )}
+          </div>
+
+          {/* 报告生成后的交互式复盘：AI 基于报告数据继续提问，逐层深入，要点存入画像 */}
+          {(loopSum[tab] || current) && !loopLoading && loading !== tab && (
+            <ReportCoachChat
+              key={`${tab}-${loopSum[tab]?.date ?? current?.date}`}
+              label={PERIOD_LABEL[tab]}
+              snapshot={reportSnapshotText(tab)}
+              onOpenAssistant={() => window.dispatchEvent(new CustomEvent('ai-chat-open'))}
+            />
           )}
 
           {/* 情绪-消费分析（周报/月报附带） */}
@@ -719,7 +918,7 @@ export default function Report() {
               <span style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>次 / 本月</span>
             </div>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 8, lineHeight: 1.8 }}>
-              包含报告生成、AI 问答、截图/语音记账解析，每次调用消耗 DeepSeek 额度
+              包含报告生成、AI 问答、截图/语音记账解析，每次调用消耗你配置的模型账户额度
             </div>
           </div>
 
@@ -727,10 +926,10 @@ export default function Report() {
           <div className="card" style={{ padding: 20 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text)', marginBottom: 12 }}>🚀 快捷操作</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <ActionBtn color="#0040FF" disabled={loading !== null} onClick={() => { void handleGenerate('week'); toastIt('周报生成中，完成后切到「每周分析」查看') }}>
+              <ActionBtn color="#0040FF" disabled={loopLoading !== null || loading !== null} onClick={() => { setTab('week'); void runLoopAI('week'); toastIt('周报自主分析中，完成后在「每周分析」查看') }}>
                 📊 一键生成周报
               </ActionBtn>
-              <ActionBtn color="#06B6D4" disabled={loading !== null} onClick={() => { void handleGenerate('month'); toastIt('月报生成中，完成后切到「每月复盘」查看') }}>
+              <ActionBtn color="#06B6D4" disabled={loopLoading !== null || loading !== null} onClick={() => { setTab('month'); void runLoopAI('month'); toastIt('月报自主分析中，完成后在「每月复盘」查看') }}>
                 📈 一键生成月报
               </ActionBtn>
             </div>

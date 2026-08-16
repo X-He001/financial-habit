@@ -253,3 +253,28 @@ export interface PullResponse {
 export function fetchSyncPull(): Promise<PullResponse> {
   return request<PullResponse>('/api/sync/pull', 'GET')
 }
+
+// ----- 数据同步（批量推送） -----
+
+/** 单表推送统计（服务器返回） */
+export interface PushTableStats {
+  pushed: number
+  updated: number
+  skipped: number
+  failed: number
+}
+
+export interface PushResponse {
+  success: boolean
+  total: number
+  byTable: Record<string, PushTableStats>
+}
+
+/**
+ * 批量推送：POST /api/sync/push，把各同步表的本地快照一次性发给云端。
+ * 服务器按行 INSERT OR REPLACE（同 id 即视为更新），行级「最后写入优先」。
+ * 返回每表的 pushed / updated / skipped / failed 统计。
+ */
+export function fetchSyncPush(tables: Record<string, unknown[]>): Promise<PushResponse> {
+  return request<PushResponse>('/api/sync/push', 'POST', { tables })
+}

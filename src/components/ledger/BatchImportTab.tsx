@@ -1,6 +1,7 @@
 import { useState, useRef } from 'react'
 import { parseImportFile } from '../../utils/batchImport'
 import type { BatchItem } from '../../utils/batchImport'
+import { parseCsvToBatchItems } from '../../utils/csvImporter'
 import BatchPreviewList from './BatchPreviewList'
 
 interface Props {
@@ -9,8 +10,8 @@ interface Props {
 }
 
 const STEPS = [
-  '上传账单文件：Excel（.xlsx/.xls）、PDF 账单、或交易截图（.png/.jpg/.jpeg）',
-  '自动解析 + AI 识别：一份文件里不管有 1 条还是 20 条记录，都会全部提取出来',
+  '上传账单文件：CSV（支付宝/微信导出）、Excel（.xlsx/.xls）、PDF 账单、或交易截图（.png/.jpg/.jpeg）',
+  'CSV 自动按交易单号去重；其余文件自动解析 + AI 识别：一份文件里不管有 1 条还是 20 条记录，都会全部提取出来',
   '确认无误后批量保存，自动计算每条记录的冲动指数',
 ]
 
@@ -28,6 +29,30 @@ export default function BatchImportTab({ onSaved }: Props) {
     setError(null)
     setItems(null)
     setFileName(file.name)
+    // F3：CSV 走本地解析（UTF-8/GBK、列名模糊、时间容错、文件内去重）；其余走 AI 识别
+    if (file.name.toLowerCase().endsWith('.csv')) {
+      setBusy(true)
+      setStage({ label: '解析 CSV 账单…', percent: 40 })
+      void parseCsvToBatchItems(file)
+        .then((res) => {
+          if (res.items.length === 0) {
+            setError('没解析到有效记录。请确认导出的账单包含「交易时间」「金额」列，且是已支付成功的记录')
+            setFileName('')
+          } else {
+            setItems(res.items)
+            if (res.skipped > 0) setError(`⚠️ 文件内发现 ${res.skipped} 条重复交易单号，已自动去重`)
+          }
+        })
+        .catch((e) => {
+          setError(e instanceof Error ? e.message : '解析失败，请重试')
+          setFileName('')
+        })
+        .finally(() => {
+          setBusy(false)
+          setStage(null)
+        })
+      return
+    }
     setBusy(true)
     setStage({ label: '开始解析…', percent: 0 })
     void parseImportFile(file, (label, percent) => setStage({ label, percent }))
@@ -67,7 +92,7 @@ export default function BatchImportTab({ onSaved }: Props) {
           </div>
         ))}
         <div style={{ fontSize: 11.5, color: '#6B7280', marginTop: 6, lineHeight: 1.7 }}>
-          支持一份文件含多条记录；单文件 ≤10MB；图片优先用视觉模型直接识别（纯文本模型会先本地 OCR 再让 AI 整理，首次使用需联网下载识别模型）。
+          支持一份文件含多条记录；单文件 ≤10MB；CSV 本地解析（UTF-8/GBK 自动识别、按交易单号去重）；图片优先用视觉模型直接识别（纯文本模型会先本地 OCR 再让 AI 整理，首次使用需联网下载识别模型）。
         </div>
       </div>
 
@@ -93,13 +118,13 @@ export default function BatchImportTab({ onSaved }: Props) {
           <div style={{ fontSize: 14, fontWeight: 600, color: '#0040FF', marginBottom: 4 }}>
             {dragOver ? '松手开始解析' : '把账单文件拖到这里'}
           </div>
-          <div style={{ fontSize: 12, color: '#A0A4A4' }}>或点击选择文件 · 支持 Excel / PDF / 截图</div>
+          <div style={{ fontSize: 12, color: '#A0A4A4' }}>或点击选择文件 · 支持 CSV / Excel / PDF / 截图</div>
         </div>
       )}
       <input
         ref={fileRef}
         type="file"
-        accept=".xlsx,.xls,.pdf,.png,.jpg,.jpeg,image/png,image/jpeg"
+        accept=".csv,text/csv,.xlsx,.xls,.pdf,.png,.jpg,.jpeg,image/png,image/jpeg"
         style={{ display: 'none' }}
         onChange={(e) => {
           const f = e.target.files?.[0]

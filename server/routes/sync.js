@@ -5,6 +5,7 @@
 // =====================================================================
 import { Router } from 'express'
 import { db } from '../db.js'
+import { broadcast } from '../realtime.js'
 
 // 每张业务表的同步配置：
 //   api     返回给前端的数据键名（对应 IndexedDB 表名）
@@ -182,6 +183,36 @@ const TABLES = [
       feePerMinor: 'fee_per_minor', realApr: 'real_apr', createdAt: 'created_at',
     },
   },
+  {
+    api: 'knowledgeRefs', table: 'knowledge_refs',
+    json: ['applicable_scenarios', 'action_templates'],
+    fields: {
+      category: 'category', concept: 'concept', book: 'book', author: 'author',
+      thesis: 'thesis', applicableScenarios: 'applicable_scenarios',
+      actionTemplates: 'action_templates', plainExplanation: 'plain_explanation',
+      citation: 'citation', status: 'status',
+    },
+  },
+  {
+    api: 'feedbackLogs', table: 'feedback_logs',
+    fields: {
+      inboxId: 'inbox_id', type: 'type', objectType: 'object_type',
+      objectId: 'object_id', knowledgeRefId: 'knowledge_ref_id',
+      hypothesis: 'hypothesis', opening: 'opening', patternKey: 'pattern_key',
+      beforeMinor: 'before_minor', afterMinor: 'after_minor',
+      effectStatus: 'effect_status', effectCheckedAt: 'effect_checked_at',
+      rounds: 'rounds', createdAt: 'created_at',
+    },
+  },
+  {
+    api: 'agentInbox', table: 'agent_inbox',
+    fields: {
+      kind: 'kind', objectType: 'object_type', objectId: 'object_id',
+      title: 'title', opening: 'opening', knowledgeRefId: 'knowledge_ref_id',
+      feedbackLogId: 'feedback_log_id', scheduledAt: 'scheduled_at',
+      status: 'status', rounds: 'rounds', createdAt: 'created_at',
+    },
+  },
 ]
 
 /** 单行：snake_case 数据库行 → camelCase（与前端 IndexedDB 记录一致） */
@@ -209,7 +240,32 @@ function rowToJson(cfg, row) {
     }
     out[api] = v
   }
+  // updated_at 通用列（LWW 合并用）：存在则回传 camelCase 字段
+  if (row.updated_at !== undefined && row.updated_at !== null && row.updated_at !== '') {
+    out.updatedAt = row.updated_at
+  }
   return out
+}
+
+/** 单行：camelCase 前端数据 → snake_case 数据库行（push 用；bool/json 序列化） */
+function jsonToRow(cfg, json) {
+  const idCol = cfg.idCol || 'id'
+  const id = json.id !== undefined && json.id !== null && json.id !== '' ? String(json.id) : null
+  if (id === null) return null
+  const row = { [idCol]: id }
+  for (const [api, col] of Object.entries(cfg.fields)) {
+    if (json[api] === undefined || col === idCol) continue
+    let v = json[api]
+    if (cfg.bool?.includes(col)) {
+      v = v ? 1 : 0
+    } else if (cfg.json?.includes(col) && typeof v !== 'string') {
+      v = JSON.stringify(v ?? null)
+    }
+    row[col] = v
+  }
+  // updated_at：有值保留（编辑时间戳），缺失补当前时间（兼容旧数据，写入即视为最新）
+  row.updated_at = typeof json.updatedAt === 'string' && json.updatedAt ? json.updatedAt : new Date().toISOString()
+  return row
 }
 
 export const syncRouter = Router()
@@ -232,5 +288,41 @@ syncRouter.get('/pull', (req, res, next) => {
     }
     if (skipped > 0) console.warn(`[sync] pull 跳过 ${skipped} 行缺少 id 的记录`)
     res.json({ success: true, data })
+  } catch (e) { next(e) }
+})
+
+// POST /api/sync/push：批量写入全部业务表（INSERT OR REPLACE = 行级最后写入优先）
+// body: { tables: { 表名: [camelCase 行, ...] } }，返回每表 pushed/updated/skipped/failed 统计
+syncRouter.post('/push', (req, res, next) => {
+  try {
+    const tables = req.body?.tables ?? {}
+    const byTable = {}
+    let total = 0
+    for (const cfg of TABLES) {
+      const rows = Array.isArray(tables[cfg.api]) ? tables[cfg.api] : []
+      const stats = { pushed: 0, updated: 0, skipped: 0, failed: 0 }
+      for (const json of rows) {
+        try {
+          const row = jsonToRow(cfg, json)
+          if (!row) { stats.skipped++; continue }
+          const idCol = cfg.idCol || 'id'
+          const id = row[idCol]
+          const exists = db.prepare(`SELECT ${idCol} FROM ${cfg.table} WHERE ${idCol} = ?`).get(id)
+          const cols = Object.keys(row)
+          const sql = `INSERT OR REPLACE INTO ${cfg.table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+          db.prepare(sql).run(...cols.map(c => row[c]))
+          if (exists) stats.updated++
+          else stats.pushed++
+        } catch (e) {
+          stats.failed++
+          console.warn(`[sync] push ${cfg.api} 单行失败：`, e?.message ?? e)
+        }
+      }
+      byTable[cfg.api] = stats
+      total += stats.pushed + stats.updated
+    }
+    // 通知其他在线客户端拉取（by 透传本端 clientId，写入端可忽略自身变更）
+    broadcast({ type: 'data-changed', by: req.header('x-client-id') ?? 'server', at: Date.now() })
+    res.json({ success: true, total, byTable })
   } catch (e) { next(e) }
 })

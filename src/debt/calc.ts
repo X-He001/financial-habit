@@ -156,3 +156,22 @@ export function simulateRepay(
   }
   return { months, totalInterestMinor: totalInterest }
 }
+
+/**
+ * 按月还款模拟"清零所需天数"：每月先滚 30 天日复利利息，再还 monthlyMinor。
+ * 用于"这笔消费会让清零日推迟 X 天"与"本周信贷消费累计推迟 X 天"估算。
+ * principalMinor<=0 返回 0；月供不足/超过 100 个月仍还不清返回 null（无法清零）。
+ */
+export function simulateClearDays(principalMinor: number, monthlyMinor: number, dailyRate: number): number | null {
+  if (principalMinor <= 0) return 0
+  if (monthlyMinor <= 0 || dailyRate < 0) return null
+  let rem = principalMinor
+  let days = 0
+  let guard = 0
+  while (rem > 0 && guard < 1200) {
+    rem = rem * Math.pow(1 + dailyRate, 30) - monthlyMinor
+    days += 30
+    guard++
+  }
+  return rem <= 0 ? days : null
+}

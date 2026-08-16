@@ -1,29 +1,28 @@
 // =====================================================================
 // 本地 → 云端 推送同步
-// 本地 IndexedDB 为主，云端为备份/同步
-// 用法：全量推送 pushSync()，遍历核心表逐条 POST/PUT 到后端
+// 本地 IndexedDB 为主，云端为仓库/备份。
+// 用法：pushSync() —— 全部同步表逐表 toArray() 取本地快照，
+// 一次性 POST /api/sync/push 批量写入；服务器按行 INSERT OR REPLACE
+// （同 id 视为更新，行级「最后写入优先」）。
+// 自动同步时由 realtimeSync 的 requestPushToCloud() 防抖触发（2.5s 合并）；
+// 设置页保留「推送本地数据到云端」手动按钮作兜底。
 // =====================================================================
 import { db } from '../db/database'
 import { getSetting, setSetting } from '../db/crud'
-import {
-  setBaseUrl, getBaseUrl, checkHealth,
-  fetchTransactions, saveTransaction, updateTransaction,
-  fetchSavingsGoals, saveSavingsGoal, updateSavingsGoal,
-  fetchDebts, saveDebt, updateDebt,
-  fetchSchedules, saveSchedule, updateSchedule,
-  fetchSettings, saveSetting, updateSetting,
-} from './api'
+import { setBaseUrl, getBaseUrl, checkHealth, fetchSyncPush } from './api'
+import { SYNC_TABLE_NAMES } from '../db/syncHooks'
+import { SYNC_URL_KEY, LAST_SYNC_AT_KEY } from './keys'
 
-export const SYNC_URL_KEY = 'syncServerUrl'
-export const LAST_SYNC_AT_KEY = 'lastSyncAt'
+// 兼容旧导入路径（crud/pullSync 已改为从 keys 导入，这里保留再导出）
+export { SYNC_URL_KEY, LAST_SYNC_AT_KEY } from './keys'
 
 // ---- 统计 ----
 
 export interface TableStats {
-  pushed: number  // 新增（POST）
-  updated: number // 更新（PUT）
-  skipped: number // 跳过（无 id 或云端一致）
-  failed: number  // 请求失败
+  pushed: number  // 新增（云端原本没有该 id）
+  updated: number // 更新（云端已存在该 id）
+  skipped: number // 跳过（无有效 id）
+  failed: number  // 服务器写入失败
 }
 
 export interface SyncResult {
@@ -31,64 +30,6 @@ export interface SyncResult {
   byTable: Record<string, TableStats>
   total: number
   error?: string
-}
-
-// ---- 核心表配置 ----
-
-type CoreTableName = 'transactions' | 'savingsGoals' | 'debts' | 'schedules' | 'settings'
-
-interface TableConfig {
-  name: CoreTableName
-  /** 拉云端 id 列表 */
-  fetchCloudIds: () => Promise<string[]>
-  /** 保存：POST（id 不存在）或 PUT（id 已存在） */
-  saveRow: (row: Record<string, unknown>, exists: boolean) => Promise<void>
-}
-
-function getTableConfigs(): TableConfig[] {
-  return [
-    {
-      name: 'transactions',
-      fetchCloudIds: async () => (await fetchTransactions()).map(t => t.id),
-      saveRow: async (row, exists) => {
-        if (exists) await updateTransaction(row.id as string, row as Parameters<typeof updateTransaction>[1])
-        else await saveTransaction(row as Parameters<typeof saveTransaction>[0])
-      },
-    },
-    {
-      name: 'savingsGoals',
-      fetchCloudIds: async () => (await fetchSavingsGoals()).map(g => g.id),
-      saveRow: async (row, exists) => {
-        if (exists) await updateSavingsGoal(row.id as string, row as Parameters<typeof updateSavingsGoal>[1])
-        else await saveSavingsGoal(row as Parameters<typeof saveSavingsGoal>[0])
-      },
-    },
-    {
-      name: 'debts',
-      fetchCloudIds: async () => (await fetchDebts()).map(d => d.id),
-      saveRow: async (row, exists) => {
-        if (exists) await updateDebt(row.id as string, row as Parameters<typeof updateDebt>[1])
-        else await saveDebt(row as Parameters<typeof saveDebt>[0])
-      },
-    },
-    {
-      name: 'schedules',
-      fetchCloudIds: async () => (await fetchSchedules()).map(s => s.id),
-      saveRow: async (row, exists) => {
-        if (exists) await updateSchedule(row.id as string, row as Parameters<typeof updateSchedule>[1])
-        else await saveSchedule(row as Parameters<typeof saveSchedule>[0])
-      },
-    },
-    {
-      name: 'settings',
-      fetchCloudIds: async () => (await fetchSettings()).map(s => s.id),
-      saveRow: async (row, exists) => {
-        const r = { id: row.id as string, value: String(row.value ?? '') }
-        if (exists) await updateSetting(r.id, { value: r.value })
-        else await saveSetting(r)
-      },
-    },
-  ]
 }
 
 // ---- 地址管理 ----
@@ -122,8 +63,9 @@ export async function testServerConnection(url: string): Promise<{ ok: boolean; 
 // ---- 同步推送 ----
 
 /**
- * 全量推送：遍历本地核心表，逐条 POST/PUT 到云端
- * 返回每张表的 pushed / updated / skipped / failed 统计
+ * 全量推送：把全部同步表（21 张）当前数据整表快照批量 POST 到云端。
+ * 服务器对每条记录 INSERT OR REPLACE（相同 id 视为更新），行级 LWW。
+ * 返回每张表的 pushed / updated / skipped / failed 统计。
  */
 export async function pushSync(): Promise<SyncResult> {
   const result: SyncResult = { ok: false, byTable: {}, total: 0 }
@@ -132,48 +74,23 @@ export async function pushSync(): Promise<SyncResult> {
     // 先确保连通
     await checkHealth()
 
-    const configs = getTableConfigs()
-
-    for (const cfg of configs) {
-      const stats: TableStats = { pushed: 0, updated: 0, skipped: 0, failed: 0 }
-
-      // 拉云端 id 集合
-      let cloudIds: Set<string>
-      try {
-        const ids = await cfg.fetchCloudIds()
-        cloudIds = new Set(ids)
-      } catch {
-        // 云端列表拉取失败（表可能为空或网络问题），当作空集合处理
-        cloudIds = new Set()
-      }
-
-      // 读本地表
-      const table = (db as unknown as Record<string, { toArray: () => Promise<Record<string, unknown>[]> }>)[cfg.name]
-      const rows = await table.toArray()
-
-      for (const row of rows) {
-        const id = row.id as string | undefined
-        if (!id) {
-          stats.skipped++
-          continue
-        }
-        const exists = cloudIds.has(id)
-        try {
-          await cfg.saveRow(row, exists)
-          if (exists) stats.updated++
-          else stats.pushed++
-        } catch {
-          stats.failed++
-        }
-      }
-
-      result.byTable[cfg.name] = stats
+    // 逐表取本地快照（表缺失时跳过，避免旧版库结构差异导致失败）
+    const tables: Record<string, unknown[]> = {}
+    for (const name of SYNC_TABLE_NAMES) {
+      const table = (db as unknown as Record<string, { toArray: () => Promise<unknown[]> } | undefined>)[name]
+      if (!table) continue
+      tables[name] = await table.toArray()
     }
 
-    result.total = Object.values(result.byTable).reduce(
-      (s, t) => s + t.pushed + t.updated, 0,
-    )
+    const resp = await fetchSyncPush(tables)
+    if (!resp?.success) {
+      throw new Error('服务器返回异常：' + JSON.stringify(resp ?? null))
+    }
+
+    result.byTable = resp.byTable
+    result.total = resp.total
     result.ok = true
+    // 记录最近同步时间（settings 表写入不触发推送，避免自循环）
     await setSetting(LAST_SYNC_AT_KEY, Date.now())
   } catch (e) {
     result.error = e instanceof Error ? e.message : String(e)
