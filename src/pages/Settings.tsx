@@ -122,6 +122,8 @@ function ModelConfigCard({
   const [configured, setConfigured] = useState(false)
   const [testBusy, setTestBusy] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
+  /** 当用户切换厂商但 Key 未更新时，显示提示 */
+  const [keyProviderMismatch, setKeyProviderMismatch] = useState(false)
 
   useEffect(() => { void load() }, [purpose])
 
@@ -142,9 +144,10 @@ function ModelConfigCard({
       setConfigured(false)
     }
     setTestResult(null)
+    setKeyProviderMismatch(false)
   }
 
-  /** 选择厂商：自动加载该厂商第一个模型并填充 API Base URL（自定义模式保留手动输入） */
+  /** 选择厂商：自动加载该厂商第一个模型并填充 API Base URL，同时清除旧 Key（不同厂商 Key 不通用） */
   function handleProviderChange(id: ModelProviderId) {
     setProvider(id)
     setTestResult(null)
@@ -154,6 +157,12 @@ function ModelConfigCard({
       setModelName(p.models[0])
       setApiUrl(p.apiUrl)
     }
+    // 切换厂商时清除旧 Key，避免用 A 厂商的 Key 调 B 厂商的 API（最常见 401 原因）
+    if (apiKey.trim()) {
+      setApiKey('')
+      setKeyProviderMismatch(false)
+      onToast('⚠️ 已切换厂商，请填写新厂商的 API Key（不同厂商的 Key 不通用）')
+    }
   }
 
   /** 选择模型：自动填充 API Base URL（按厂商表） */
@@ -162,6 +171,13 @@ function ModelConfigCard({
     setTestResult(null)
     const p = getProvider(provider)
     if (p && p.id !== CUSTOM_PROVIDER_ID) setApiUrl(p.apiUrl)
+  }
+
+  /** 用户手动输入 Key 时，清除厂商不匹配提示 */
+  function handleKeyChange(k: string) {
+    setApiKey(k)
+    setTestResult(null)
+    setKeyProviderMismatch(false)
   }
 
   async function handleSave() {
@@ -275,12 +291,21 @@ function ModelConfigCard({
 
       {/* API Key */}
       <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>API Key</div>
-      <div style={{ position: 'relative', marginBottom: 14 }}>
+      {isVision && (
+        <div style={{
+          fontSize: 11.5, color: '#f59e0b', marginBottom: 8, lineHeight: 1.6,
+          padding: '6px 10px', borderRadius: 8, background: 'rgba(245,158,11,0.08)',
+          border: '1px solid rgba(245,158,11,0.2)',
+        }}>
+          ⚠️ 识图模型需要<b>所选厂商的 API Key</b>（与主模型 Key 独立，不可混用）。如果主模型是 DeepSeek 而识图模型是千问，请填写千问的 Key。
+        </div>
+      )}
+      <div style={{ position: 'relative', marginBottom: 4 }}>
         <input
           type={showApiKey ? 'text' : 'password'}
           value={apiKey}
-          onChange={(e) => { setApiKey(e.target.value); setTestResult(null) }}
-          placeholder="sk-..."
+          onChange={(e) => handleKeyChange(e.target.value)}
+          placeholder={provider === 'qwen' ? 'sk-...（DashScope/百炼 API Key）' : 'sk-...'}
           style={inputStyle}
         />
         <button
@@ -292,6 +317,15 @@ function ModelConfigCard({
           }}>
           {showApiKey ? '🙈' : '👁'}
         </button>
+      </div>
+      {/* Key 格式提示 */}
+      <div style={{ fontSize: 11, color: '#888888', marginBottom: 14, lineHeight: 1.5 }}>
+        {provider === 'qwen' && '阿里云百炼控制台 → API Key 管理 → 创建 API Key（需在控制台开通对应模型服务）'}
+        {provider === 'deepseek' && 'DeepSeek 开放平台 → API Keys → 创建'}
+        {provider === 'volcano' && '火山引擎控制台 → 模型推理 → API Key 管理'}
+        {provider === 'kimi' && 'Moonshot 开放平台 → API Key 管理'}
+        {provider === 'zhipu' && '智谱开放平台 → API Keys → 创建'}
+        {provider === 'minimax' && 'MiniMax 开放平台 → API Keys → 创建'}
       </div>
 
       {/* 测试连接结果 */}
@@ -778,7 +812,7 @@ export default function Settings() {
             purpose="vision"
             icon="📷"
             title="识图模型（截图识别用）"
-            description="截图识别、图片记账等带图片的请求使用识图模型。建议选择支持视觉输入的模型（如 qwen3-vl-plus / GLM-4V-Plus）。未配置时截图识别自动使用主模型。"
+            description="截图识别、图片记账等带图片的请求使用识图模型。建议选择支持视觉输入的模型（如 qwen3-vl-plus / GLM-4V-Plus / MiniMax-M3）。需要单独配置该厂商的 API Key（与主模型 Key 独立），未配置时截图识别自动使用主模型。"
             onToast={(msg) => { setToast(msg); setTimeout(() => setToast(null), 2500) }}
           />
 
