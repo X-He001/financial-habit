@@ -113,8 +113,11 @@ export async function chatCompletion(
       body: JSON.stringify(body),
       signal: controller.signal,
     })
-  } catch {
+  } catch (e) {
     if (timedOut) throw new Error('TIMEOUT')
+    // 区分 CORS 错误
+    const errMsg = e instanceof Error ? e.message : String(e)
+    if (errMsg.includes('Failed to fetch')) throw new Error('CORS_ERROR')
     throw new Error('NETWORK_ERROR')
   } finally {
     clearTimeout(timer)
@@ -124,15 +127,19 @@ export async function chatCompletion(
     // 400 = 请求内容不被接受（如模型不支持图片）→ 图片识别走降级
     if (resp.status === 400) throw new VisionUnsupportedError()
     if (resp.status === 401) throw new Error('INVALID_KEY')
+    if (resp.status === 402) throw new Error('API_ERROR:402')
+    if (resp.status === 403) throw new Error('API_ERROR:403')
+    if (resp.status === 429) throw new Error('API_ERROR:429')
     throw new Error(`API_ERROR:${resp.status}`)
   }
 
   // ---- 流式（SSE） ----
   if (useStream && resp.body) {
     let full = ''
+    let streamTimedOut = false
     const reader = resp.body.getReader()
     const decoder = new TextDecoder()
-    const timeoutReader = setTimeout(() => { reader.cancel().catch(() => undefined) }, REQUEST_TIMEOUT_MS)
+    const timeoutReader = setTimeout(() => { streamTimedOut = true; reader.cancel().catch(() => undefined) }, REQUEST_TIMEOUT_MS)
     try {
       for (;;) {
         const { done, value } = await reader.read()
@@ -159,7 +166,7 @@ export async function chatCompletion(
         }
       }
     } catch {
-      if (timedOut) throw new Error('TIMEOUT')
+      if (streamTimedOut) throw new Error('TIMEOUT')
       throw new Error('NETWORK_ERROR')
     } finally {
       clearTimeout(timeoutReader)
@@ -214,8 +221,10 @@ export async function agentCompletion(
       }),
       signal: controller.signal,
     })
-  } catch {
+  } catch (e) {
     if (timedOut) throw new Error('TIMEOUT')
+    const errMsg = e instanceof Error ? e.message : String(e)
+    if (errMsg.includes('Failed to fetch')) throw new Error('CORS_ERROR')
     throw new Error('NETWORK_ERROR')
   } finally {
     clearTimeout(timer)
@@ -223,6 +232,9 @@ export async function agentCompletion(
 
   if (!resp.ok) {
     if (resp.status === 401) throw new Error('INVALID_KEY')
+    if (resp.status === 402) throw new Error('API_ERROR:402')
+    if (resp.status === 403) throw new Error('API_ERROR:403')
+    if (resp.status === 429) throw new Error('API_ERROR:429')
     throw new Error(`API_ERROR:${resp.status}`)
   }
 
@@ -393,6 +405,7 @@ export function aiErrorMessage(e: unknown): string {
   if (msg === 'NO_API_KEY') return '请先到设置页配置 API Key'
   if (msg === 'NO_MAIN_MODEL') return '请先到设置页配置主模型（AI 对话与分析模型）'
   if (msg === 'NETWORK_ERROR') return '网络异常，请检查网络后重试'
+  if (msg === 'CORS_ERROR') return '跨域请求被浏览器拦截，请尝试通过后端代理访问或更换支持浏览器直连的 API 厂商'
   if (msg === 'TIMEOUT') return '请求超时（30秒），请稍后再试'
   if (msg === 'INVALID_KEY') return 'API Key 无效，请到设置页检查'
   if (msg === 'EMPTY_RESPONSE') return 'AI 返回为空，请重试'
@@ -400,6 +413,7 @@ export function aiErrorMessage(e: unknown): string {
   if (msg.startsWith('API_ERROR:')) {
     const code = Number(msg.slice(10))
     if (code === 402) return '所选模型厂商账户余额不足，请到对应平台充值'
+    if (code === 403) return 'API 访问被拒绝（403），请检查 API Key 权限或账户状态'
     if (code === 429) return '请求过于频繁，请稍后再试'
     if (code === 401) return 'API Key 无效，请到设置页检查'
     return `服务暂时不可用（${code}），请稍后再试`
@@ -577,8 +591,14 @@ export async function testModelConnection(cfg: ModelConfig): Promise<ConnectionT
   if (!url) return { ok: false, message: '请先填写 API Base URL' }
   if (!model) return { ok: false, message: '请先填写模型 ID' }
 
+  // 校验 URL 格式（必须包含协议头 http(s)://）
+  if (!/^https?:\/\/.+/.test(url)) {
+    return { ok: false, message: 'API Base URL 格式错误，需以 http:// 或 https:// 开头' }
+  }
+
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  let timedOut = false
+  const timer = setTimeout(() => { timedOut = true; controller.abort() }, REQUEST_TIMEOUT_MS)
   let resp: Response
   try {
     resp = await fetch(`${url}/chat/completions`, {
@@ -595,23 +615,52 @@ export async function testModelConnection(cfg: ModelConfig): Promise<ConnectionT
       }),
       signal: controller.signal,
     })
-  } catch {
-    return { ok: false, message: '网络连接失败，请检查 API Base URL 与网络' }
+  } catch (e) {
+    if (timedOut) {
+      return { ok: false, message: '请求超时（30秒），请检查网络速度或 API 服务是否可用' }
+    }
+    // 区分 CORS 错误：浏览器安全策略拦截跨域请求时，fetch 抛 TypeError 且 message 包含 "Failed to fetch"
+    const errMsg = e instanceof Error ? e.message : String(e)
+    const isCors = errMsg.includes('Failed to fetch') && !timedOut
+    if (isCors) {
+      return {
+        ok: false,
+        message: '跨域请求被浏览器拦截（CORS）。请在后端（服务器）或通过 VPN/代理访问该 API，或尝试使用其他支持浏览器直连的 API 厂商（如 DeepSeek、千问等）',
+      }
+    }
+    return { ok: false, message: `网络连接失败：${errMsg || '无法连接到 API 服务器'}。请检查 API Base URL 与网络连接` }
   } finally {
     clearTimeout(timer)
   }
 
-  if (resp.status === 401) return { ok: false, message: 'API Key 无效（401），请检查后重试' }
-  if (resp.status === 429) return { ok: false, message: '请求过于频繁（429），请稍后再试' }
+  if (resp.status === 401) return { ok: false, message: 'API Key 无效（401 Unauthorized），请检查 Key 是否正确且未过期' }
+  if (resp.status === 403) return { ok: false, message: 'API 访问被拒绝（403 Forbidden），请检查 API Key 权限或账户状态' }
+  if (resp.status === 429) return { ok: false, message: '请求过于频繁（429 Too Many Requests），请稍后再试' }
+  if (resp.status === 402) return { ok: false, message: '账户余额不足（402 Payment Required），请到对应平台充值' }
+  if (resp.status === 404) return { ok: false, message: 'API 端点不存在（404），请检查 API Base URL 是否正确（可能需要末尾加 /v1 等版本路径）' }
   if (!resp.ok) {
-    const detail = (await resp.text().catch(() => '')).slice(0, 200)
-    return { ok: false, message: `服务返回错误（HTTP ${resp.status}）${detail ? '：' + detail : ''}` }
+    // 尝试读取响应体获取更多错误详情
+    let detail = ''
+    try {
+      const body = await resp.text()
+      if (body) {
+        // 尝试解析为 JSON 获取结构化错误信息
+        try {
+          const errJson = JSON.parse(body)
+          detail = errJson?.error?.message || errJson?.message || body.slice(0, 200)
+        } catch {
+          detail = body.slice(0, 200)
+        }
+      }
+    } catch { /* 忽略 */ }
+    const detailMsg = detail ? `：${detail}` : ''
+    return { ok: false, message: `服务返回错误（HTTP ${resp.status}）${detailMsg}` }
   }
 
   const data = await resp.json().catch(() => null)
   const content = data?.choices?.[0]?.message?.content
   if (typeof content !== 'string' || !content.trim()) {
-    return { ok: false, message: '返回内容为空，请检查模型 ID 是否填写正确' }
+    return { ok: false, message: '返回内容为空，请检查模型 ID 是否填写正确（或该模型不支持纯文本对话）' }
   }
   return { ok: true, message: '连接成功' }
 }
